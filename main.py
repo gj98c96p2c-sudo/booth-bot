@@ -66,7 +66,6 @@ bot = MyBot()
 # --- Botがサーバーに参加した時の自動挨拶＆説明機能 ---
 @bot.event
 async def on_guild_join(guild: discord.Guild):
-    # 送信先のチャンネルを探す（システムチャンネル ➔ 送信可能な一番上のテキストチャンネル）
     target_channel = guild.system_channel
 
     if target_channel is None or not target_channel.permissions_for(guild.me).send_messages:
@@ -78,7 +77,6 @@ async def on_guild_join(guild: discord.Guild):
     if target_channel is None:
         return
 
-    # 説明Embedの作成
     embed = discord.Embed(
         title="🎉 BOOTH通知Bot が導入されました！",
         description=(
@@ -304,7 +302,8 @@ async def check_booth_job():
                                 )
                                 await db.commit()
 
-                            if likes >= 300 and is_notified == 0:
+                            # 【テスト用一時変更】スキ数が0以上（＝未通知の新作）なら通知を飛ばす
+                            if likes >= 0 and is_notified == 0:
                                 await broadcast_item(
                                     item_id,
                                     title,
@@ -345,7 +344,7 @@ async def broadcast_item(item_id, title, url, price, category, likes):
             channels = await cursor.fetchall()
 
     embed = discord.Embed(
-        title=f"❤️ スキ300達成！ [{category}]",
+        title=f"❤️ スキ達成！ [{category}]（※テスト通知）",
         description=f"**[{title}]({url})**",
         color=0xFF6473,
     )
