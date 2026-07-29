@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import os
+import re
 import aiohttp
 from aiohttp import web
 import aiosqlite
@@ -68,7 +69,10 @@ bot = MyBot()
 async def on_guild_join(guild: discord.Guild):
     target_channel = guild.system_channel
 
-    if target_channel is None or not target_channel.permissions_for(guild.me).send_messages:
+    if (
+        target_channel is None
+        or not target_channel.permissions_for(guild.me).send_messages
+    ):
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
                 target_channel = channel
@@ -100,7 +104,11 @@ async def on_guild_join(guild: discord.Guild):
 
     embed.add_field(
         name="⚙️ 初期設定の手順",
-        value="1. 通知を受け取りたいテキストチャンネルに移動します。\n2. `/set-channel` と入力して送信し、ドロップダウンから通知したいジャンルを選んでください！",
+        value=(
+            "1. 通知を受け取りたいテキストチャンネルに移動します。\n2."
+            " `/set-channel`"
+            " と入力して送信し、ドロップダウンから通知したいジャンルを選んでください！"
+        ),
         inline=False,
     )
 
@@ -112,7 +120,7 @@ async def on_guild_join(guild: discord.Guild):
         print(f"入室メッセージ送信エラー: {e}")
 
 
-# --- Renderが寝落ちするのを防ぐためのWebサーバー機能 ---
+# --- Webサーバー機能 ---
 async def handle_ping(request):
     return web.Response(text="BOOTH Bot is alive!")
 
@@ -179,11 +187,13 @@ class CategorySelectView(discord.ui.View):
 
         categories_display = ", ".join(self.select.values)
         await interaction.response.send_message(
-            f"✅ このチャンネル（ID: {channel_id}）に **【{categories_display}】** の通知を設定したよ！",
+            f"✅ このチャンネル（ID: {channel_id}）に"
+            f" **【{categories_display}】** の通知を設定したよ！",
             ephemeral=True,
         )
         print(
-            f"📌 【チャンネル登録完了】Channel ID: {channel_id} に {categories_display} を保存しました"
+            f"📌 【チャンネル登録完了】Channel ID: {channel_id} に"
+            f" {categories_display} を保存しました"
         )
 
 
@@ -227,25 +237,24 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-# --- 1分ごとのBOOTH巡回（デバッグログ強化版） ---
+# --- 1分ごとのBOOTH巡回（構造解析強化版） ---
 @tasks.loop(minutes=1)
 async def check_booth_job():
     print("\n🔍 --- 【1分巡回スタート】BOOTHのチェックを開始します ---")
 
-    # 登録チャンネル数のチェック
     async with aiosqlite.connect("bot_data.db") as db:
         async with db.execute("SELECT COUNT(*) FROM channels") as cursor:
             channel_count = (await cursor.fetchone())[0]
 
-    print(f"📊 現在データベースに登録されている通知先チャンネル数: {channel_count} 件")
-    if channel_count == 0:
-        print(
-            "⚠️ 【警告】送信先チャンネルが 0 件です！Discordで /set-channel を実行してください！"
-        )
+    print(
+        f"📊 現在データベースに登録されている通知先チャンネル数: {channel_count}"
+        " 件"
+    )
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
 
@@ -255,102 +264,121 @@ async def check_booth_job():
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as response:
-                    print(f"🌐 [{cat_name}] HTTPステータス: {response.status}")
                     if response.status != 200:
                         print(
-                            f"⚠️ [{cat_name}] アクセス失敗（ステータスコード: {response.status}）"
+                            f"⚠️ [{cat_name}] アクセス失敗（ステータスコード:"
+                            f" {response.status}）"
                         )
                         continue
                     html = await response.text()
 
                 soup = bs4.BeautifulSoup(html, "html.parser")
-                items = soup.select("li.item-card")
-                print(f"📦 [{cat_name}] BOOTHから取得できたアイテム数: {len(items)} 件")
 
+                # BOOTHの要素検索を複数パターンで試行
+                items = (
+                    soup.select("li.item-card")
+                    or soup.select(".item-card")
+                    or soup.select("ul.grid > li")
+                )
+                print(
+                    f"📦 [{cat_name}] BOOTHから取得できたアイテム数: {len(items)}"
+                    " 件"
+                )
+
+                parsed_count = 0
                 async with aiosqlite.connect("bot_data.db") as db:
                     for item in items:
                         try:
-                            url_tag = item.select_one(
-                                "a.item-card__title-anchor"
+                            # タイトル・URLの取得（複数パターン対応）
+                            url_tag = (
+                                item.select_one("a.item-card__title-anchor")
+                                or item.select_one(".item-card__title a")
+                                or item.select_one("a[href*='/items/']")
                             )
+
                             if not url_tag:
                                 continue
-                            item_url = url_tag.get("href", "")
-                            item_id = item_url.split("/")[-1]
 
-                            title = url_tag.text.strip()
-                            price_tag = item.select_one(".price")
+                            item_url = url_tag.get("href", "")
+                            if not item_url.startswith("http"):
+                                item_url = "https://booth.pm" + item_url
+
+                            item_id = item_url.split("/")[-1].split("?")[0]
+                            title = url_tag.text.strip() or "タイトル不明"
+
+                            # 価格の取得
+                            price_tag = item.select_one(
+                                ".price"
+                            ) or item.select_one(".item-card__price")
                             price = (
                                 price_tag.text.strip() if price_tag else "不明"
                             )
 
-                            like_tag = item.select_one(".js-like-count")
-                            likes = (
-                                int(like_tag.text.strip()) if like_tag else 0
-                            )
+                            # スキ数の取得
+                            like_tag = item.select_one(
+                                ".js-like-count"
+                            ) or item.select_one(".item-card__like-count")
+                            likes = 0
+                            if like_tag:
+                                like_text = re.sub(r"[^\d]", "", like_tag.text)
+                                likes = int(like_text) if like_text else 0
 
-                            async with db.execute(
-                                "SELECT likes, notified FROM tracked_items WHERE item_id = ?",
-                                (item_id,),
-                            ) as cursor:
-                                row = await cursor.fetchone()
+                            parsed_count += 1
 
+                            # DB保存
                             now = datetime.datetime.now()
-
-                            if not row:
-                                await db.execute(
-                                    """
-                                    INSERT INTO tracked_items (item_id, title, url, price, category, likes, created_at, notified)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                                """,
-                                    (
-                                        item_id,
-                                        title,
-                                        item_url,
-                                        price,
-                                        cat_name,
-                                        likes,
-                                        now,
-                                    ),
-                                )
-                                await db.commit()
-
-                            # テスト用：常に通知送信を試みる
-                            if likes >= 0:
-                                await broadcast_item(
+                            await db.execute(
+                                """
+                                INSERT OR IGNORE INTO tracked_items (item_id, title, url, price, category, likes, created_at, notified)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                            """,
+                                (
                                     item_id,
                                     title,
                                     item_url,
                                     price,
                                     cat_name,
                                     likes,
-                                )
-                                await db.execute(
-                                    "UPDATE tracked_items SET notified = 1 WHERE item_id = ?",
-                                    (item_id,),
-                                )
-                                await db.commit()
+                                    now,
+                                ),
+                            )
+                            await db.commit()
+
+                            # 通知送信処理へ
+                            await broadcast_item(
+                                item_id,
+                                title,
+                                item_url,
+                                price,
+                                cat_name,
+                                likes,
+                                db,
+                            )
 
                         except Exception as e:
-                            print(f"⚠️ アイテム解析エラー: {e}")
+                            print(f"⚠️ アイテム個別解析エラー: {e}")
                             continue
+
+                print(
+                    f"✅ [{cat_name}] 解析・送信成功数: {parsed_count} /"
+                    f" {len(items)} 件"
+                )
 
             except Exception as e:
                 print(f"❌ [{cat_name}] 巡回通信エラー: {e}")
 
 
-async def broadcast_item(item_id, title, url, price, category, likes):
-    async with aiosqlite.connect("bot_data.db") as db:
-        async with db.execute(
-            "SELECT channel_id, categories FROM channels"
-        ) as cursor:
-            channels = await cursor.fetchall()
+async def broadcast_item(item_id, title, url, price, category, likes, db):
+    async with db.execute(
+        "SELECT channel_id, categories FROM channels"
+    ) as cursor:
+        channels = await cursor.fetchall()
 
     if not channels:
         return
 
     embed = discord.Embed(
-        title=f"❤️ スキ達成！ [{category}]（※テスト強制限通知）",
+        title=f"❤️ スキ達成！ [{category}]（※テスト強制通知）",
         description=f"**[{title}]({url})**",
         color=0xFF6473,
     )
@@ -359,16 +387,15 @@ async def broadcast_item(item_id, title, url, price, category, likes):
     embed.set_footer(text="BOOTH新作監視Bot")
 
     for channel_id, categories_str in channels:
-        cat_list = categories_str.split(",")
+        cat_list = [c.strip() for c in categories_str.split(",")]
         if category in cat_list:
-            # キャッシュにない場合も直接Discord APIからチャンネルを取得する（重要）
             channel = bot.get_channel(channel_id)
             if not channel:
                 try:
                     channel = await bot.fetch_channel(channel_id)
                 except Exception as e:
                     print(
-                        f"⚠️ チャンネル取得エラー (ID: {channel_id}): {e}"
+                        f"❌ 【チャンネル取得失敗】ID {channel_id}: {e}"
                     )
                     continue
 
@@ -376,12 +403,14 @@ async def broadcast_item(item_id, title, url, price, category, likes):
                 try:
                     await channel.send(embed=embed)
                     print(
-                        f"🚀 【送信成功】#{channel.name} に 「{title[:15]}...」 を通知しました！"
+                        f"🚀 【送信成功】#{channel.name} に 「{title[:15]}...」"
+                        " を通知しました！"
                     )
                     await asyncio.sleep(0.2)
                 except discord.Forbidden:
                     print(
-                        f"❌ 【送信失敗】#{channel.name} へのメッセージ送信権限がありません！"
+                        f"❌ 【送信失敗】#{channel.name}"
+                        " への送信権限がありません（ボット権限確認）"
                     )
                 except Exception as e:
                     print(f"❌ 【送信エラー】#{channel.name}: {e}")
