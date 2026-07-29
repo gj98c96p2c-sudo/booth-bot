@@ -63,6 +63,57 @@ class MyBot(commands.Bot):
 bot = MyBot()
 
 
+# --- Botがサーバーに参加した時の自動挨拶＆説明機能 ---
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    # 送信先のチャンネルを探す（システムチャンネル ➔ 送信可能な一番上のテキストチャンネル）
+    target_channel = guild.system_channel
+
+    if target_channel is None or not target_channel.permissions_for(guild.me).send_messages:
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                target_channel = channel
+                break
+
+    if target_channel is None:
+        return
+
+    # 説明Embedの作成
+    embed = discord.Embed(
+        title="🎉 BOOTH通知Bot が導入されました！",
+        description=(
+            "導入ありがとうございます！\n"
+            "このBotは、BOOTHのVRChat向け新作アイテム（衣装・髪・小物・ギミック）を監視し、"
+            "**スキ（❤️）が 300 を超えた人気商品** を自動でお知らせします！"
+        ),
+        color=0xFF6473,
+    )
+
+    embed.add_field(
+        name="📌 基本コマンド（使い方）",
+        value=(
+            "`/set-channel`\n"
+            "➔ このコマンドを実行したチャンネルに通知を設定します。（ジャンル選択可）\n\n"
+            "`/remove-channel`\n"
+            "➔ このチャンネルの通知設定を解除します。"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="⚙️ 初期設定の手順",
+        value="1. 通知を受け取りたいテキストチャンネルに移動します。\n2. `/set-channel` と入力して送信し、ドロップダウンから通知したいジャンルを選んでください！",
+        inline=False,
+    )
+
+    embed.set_footer(text="BOOTH新作監視Bot • 快適なVRChatライフを！")
+
+    try:
+        await target_channel.send(embed=embed)
+    except Exception as e:
+        print(f"入室メッセージ送信エラー: {e}")
+
+
 # --- Renderが寝落ちするのを防ぐためのWebサーバー機能 ---
 async def handle_ping(request):
     return web.Response(text="BOOTH Bot is alive!")
