@@ -224,8 +224,8 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-# --- 15分ごとのBOOTH巡回 ---
-@tasks.loop(minutes=15)
+# --- 【テスト用】1分ごとのBOOTH巡回 ---
+@tasks.loop(minutes=1)
 async def check_booth_job():
     headers = {
         "User-Agent": (
