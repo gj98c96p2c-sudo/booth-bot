@@ -237,7 +237,7 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-# --- 1分ごとのBOOTH巡回（画像対応版） ---
+# --- 1分ごとのBOOTH巡回（未送信アイテム自動再試行機能付き） ---
 @tasks.loop(minutes=1)
 async def check_booth_job():
     print("\n🔍 --- 【1分巡回スタート】BOOTHのチェックを開始します ---")
@@ -302,7 +302,7 @@ async def check_booth_job():
                             item_id = item_url.split("/")[-1].split("?")[0]
                             title = url_tag.text.strip() or "タイトル不明"
 
-                            # サムネイル画像の取得（遅延読み込み属性にも対応）
+                            # サムネイル画像の取得
                             img_tag = (
                                 item.select_one(".item-card__thumbnail-images img")
                                 or item.select_one("img.js-thumbnail")
@@ -336,24 +336,64 @@ async def check_booth_job():
 
                             parsed_count += 1
 
-                            # 通知送信処理へ
-                            await broadcast_item(
-                                item_id,
-                                title,
-                                item_url,
-                                price,
-                                category=cat_name,
-                                likes=likes,
-                                image_url=image_url,
-                                db=db,
+                            # DBにアイテム情報を保存・更新（まだ未送信フラグ 0 の状態）
+                            now = datetime.datetime.now()
+                            await db.execute(
+                                """
+                                INSERT INTO tracked_items (item_id, title, url, price, category, likes, image_url, created_at, notified)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                                ON CONFLICT(item_id) DO UPDATE SET
+                                    title = excluded.title,
+                                    price = excluded.price,
+                                    likes = excluded.likes,
+                                    image_url = excluded.image_url
+                            """,
+                                (
+                                    item_id,
+                                    title,
+                                    item_url,
+                                    price,
+                                    cat_name,
+                                    likes,
+                                    image_url,
+                                    now,
+                                ),
                             )
+                            await db.commit()
+
+                            # 送信チェック（まだ通知に成功していないアイテムのみ送信を試みる）
+                            async with db.execute(
+                                "SELECT notified FROM tracked_items WHERE item_id = ?",
+                                (item_id,),
+                            ) as cursor:
+                                row = await cursor.fetchone()
+                                is_notified = row[0] if row else 0
+
+                            # 未送信の場合、送信処理へ（成功した時だけ notified = 1 に更新される）
+                            if is_notified == 0 and likes >= 0:
+                                success = await broadcast_item(
+                                    item_id,
+                                    title,
+                                    item_url,
+                                    price,
+                                    category=cat_name,
+                                    likes=likes,
+                                    image_url=image_url,
+                                    db=db,
+                                )
+                                if success:
+                                    await db.execute(
+                                        "UPDATE tracked_items SET notified = 1 WHERE item_id = ?",
+                                        (item_id,),
+                                    )
+                                    await db.commit()
 
                         except Exception as e:
                             print(f"⚠️ アイテム個別解析エラー: {e}")
                             continue
 
                 print(
-                    f"✅ [{cat_name}] 解析・送信成功数: {parsed_count} / {len(items)} 件"
+                    f"✅ [{cat_name}] 解析完了: {parsed_count} / {len(items)} 件"
                 )
 
             except Exception as e:
@@ -369,7 +409,7 @@ async def broadcast_item(
         channels = await cursor.fetchall()
 
     if not channels:
-        return
+        return False
 
     embed = discord.Embed(
         title=f"❤️ スキ達成！ [{category}]（※テスト強制通知）",
@@ -380,9 +420,10 @@ async def broadcast_item(
     embed.add_field(name="スキ数", value=f"❤️ {likes}", inline=True)
     embed.set_footer(text="BOOTH新作監視Bot")
 
-    # サムネイル画像が取得できている場合は埋め込み画像に設定
     if image_url:
         embed.set_image(url=image_url)
+
+    any_success = False
 
     for channel_id, categories_str in channels:
         cat_list = [c.strip() for c in categories_str.split(",")]
@@ -403,13 +444,16 @@ async def broadcast_item(
                     print(
                         f"🚀 【送信成功】#{channel.name} に 「{title[:15]}...」 を通知しました！"
                     )
+                    any_success = True
                     await asyncio.sleep(0.2)
                 except discord.Forbidden:
                     print(
-                        f"❌ 【送信失敗】#{channel.name} への送信権限がありません"
+                        f"❌ 【送信失敗】#{channel.name} への送信権限がありません（次回巡回で再試行します）"
                     )
                 except Exception as e:
-                    print(f"❌ 【送信エラー】#{channel.name}: {e}")
+                    print(f"❌ 【送信エラー】#{channel.name}: {e}（次回巡回で再試行します）")
+
+    return any_success
 
 
 @bot.event
