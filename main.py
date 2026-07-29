@@ -54,6 +54,7 @@ class MyBot(commands.Bot):
                     price TEXT,
                     category TEXT,
                     likes INTEGER,
+                    image_url TEXT,
                     created_at TIMESTAMP,
                     notified INTEGER DEFAULT 0
                 )
@@ -106,8 +107,7 @@ async def on_guild_join(guild: discord.Guild):
         name="⚙️ 初期設定の手順",
         value=(
             "1. 通知を受け取りたいテキストチャンネルに移動します。\n2."
-            " `/set-channel`"
-            " と入力して送信し、ドロップダウンから通知したいジャンルを選んでください！"
+            " `/set-channel` と入力して送信し、ドロップダウンから通知したいジャンルを選んでください！"
         ),
         inline=False,
     )
@@ -237,7 +237,7 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-# --- 1分ごとのBOOTH巡回（構造解析強化版） ---
+# --- 1分ごとのBOOTH巡回（画像対応版） ---
 @tasks.loop(minutes=1)
 async def check_booth_job():
     print("\n🔍 --- 【1分巡回スタート】BOOTHのチェックを開始します ---")
@@ -247,8 +247,7 @@ async def check_booth_job():
             channel_count = (await cursor.fetchone())[0]
 
     print(
-        f"📊 現在データベースに登録されている通知先チャンネル数: {channel_count}"
-        " 件"
+        f"📊 現在データベースに登録されている通知先チャンネル数: {channel_count} 件"
     )
 
     headers = {
@@ -266,30 +265,27 @@ async def check_booth_job():
                 ) as response:
                     if response.status != 200:
                         print(
-                            f"⚠️ [{cat_name}] アクセス失敗（ステータスコード:"
-                            f" {response.status}）"
+                            f"⚠️ [{cat_name}] アクセス失敗（ステータスコード: {response.status}）"
                         )
                         continue
                     html = await response.text()
 
                 soup = bs4.BeautifulSoup(html, "html.parser")
 
-                # BOOTHの要素検索を複数パターンで試行
                 items = (
                     soup.select("li.item-card")
                     or soup.select(".item-card")
                     or soup.select("ul.grid > li")
                 )
                 print(
-                    f"📦 [{cat_name}] BOOTHから取得できたアイテム数: {len(items)}"
-                    " 件"
+                    f"📦 [{cat_name}] BOOTHから取得できたアイテム数: {len(items)} 件"
                 )
 
                 parsed_count = 0
                 async with aiosqlite.connect("bot_data.db") as db:
                     for item in items:
                         try:
-                            # タイトル・URLの取得（複数パターン対応）
+                            # タイトル・URLの取得
                             url_tag = (
                                 item.select_one("a.item-card__title-anchor")
                                 or item.select_one(".item-card__title a")
@@ -305,6 +301,21 @@ async def check_booth_job():
 
                             item_id = item_url.split("/")[-1].split("?")[0]
                             title = url_tag.text.strip() or "タイトル不明"
+
+                            # サムネイル画像の取得（遅延読み込み属性にも対応）
+                            img_tag = (
+                                item.select_one(".item-card__thumbnail-images img")
+                                or item.select_one("img.js-thumbnail")
+                                or item.select_one("img")
+                            )
+                            image_url = ""
+                            if img_tag:
+                                image_url = (
+                                    img_tag.get("data-original")
+                                    or img_tag.get("data-src")
+                                    or img_tag.get("src")
+                                    or ""
+                                )
 
                             # 価格の取得
                             price_tag = item.select_one(
@@ -325,34 +336,16 @@ async def check_booth_job():
 
                             parsed_count += 1
 
-                            # DB保存
-                            now = datetime.datetime.now()
-                            await db.execute(
-                                """
-                                INSERT OR IGNORE INTO tracked_items (item_id, title, url, price, category, likes, created_at, notified)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-                            """,
-                                (
-                                    item_id,
-                                    title,
-                                    item_url,
-                                    price,
-                                    cat_name,
-                                    likes,
-                                    now,
-                                ),
-                            )
-                            await db.commit()
-
                             # 通知送信処理へ
                             await broadcast_item(
                                 item_id,
                                 title,
                                 item_url,
                                 price,
-                                cat_name,
-                                likes,
-                                db,
+                                category=cat_name,
+                                likes=likes,
+                                image_url=image_url,
+                                db=db,
                             )
 
                         except Exception as e:
@@ -360,15 +353,16 @@ async def check_booth_job():
                             continue
 
                 print(
-                    f"✅ [{cat_name}] 解析・送信成功数: {parsed_count} /"
-                    f" {len(items)} 件"
+                    f"✅ [{cat_name}] 解析・送信成功数: {parsed_count} / {len(items)} 件"
                 )
 
             except Exception as e:
                 print(f"❌ [{cat_name}] 巡回通信エラー: {e}")
 
 
-async def broadcast_item(item_id, title, url, price, category, likes, db):
+async def broadcast_item(
+    item_id, title, url, price, category, likes, image_url, db
+):
     async with db.execute(
         "SELECT channel_id, categories FROM channels"
     ) as cursor:
@@ -385,6 +379,10 @@ async def broadcast_item(item_id, title, url, price, category, likes, db):
     embed.add_field(name="価格", value=price, inline=True)
     embed.add_field(name="スキ数", value=f"❤️ {likes}", inline=True)
     embed.set_footer(text="BOOTH新作監視Bot")
+
+    # サムネイル画像が取得できている場合は埋め込み画像に設定
+    if image_url:
+        embed.set_image(url=image_url)
 
     for channel_id, categories_str in channels:
         cat_list = [c.strip() for c in categories_str.split(",")]
@@ -403,14 +401,12 @@ async def broadcast_item(item_id, title, url, price, category, likes, db):
                 try:
                     await channel.send(embed=embed)
                     print(
-                        f"🚀 【送信成功】#{channel.name} に 「{title[:15]}...」"
-                        " を通知しました！"
+                        f"🚀 【送信成功】#{channel.name} に 「{title[:15]}...」 を通知しました！"
                     )
                     await asyncio.sleep(0.2)
                 except discord.Forbidden:
                     print(
-                        f"❌ 【送信失敗】#{channel.name}"
-                        " への送信権限がありません（ボット権限確認）"
+                        f"❌ 【送信失敗】#{channel.name} への送信権限がありません"
                     )
                 except Exception as e:
                     print(f"❌ 【送信エラー】#{channel.name}: {e}")
