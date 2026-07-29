@@ -1,0 +1,4 @@
+discord.py
+aiosqlite
+beautifulsoup4
+aiohttp
