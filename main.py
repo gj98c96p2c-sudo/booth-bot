@@ -224,7 +224,7 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-# --- 【テスト用】1分ごとのBOOTH巡回 ---
+# --- 【テスト用】1分ごと＆既読無視の強制通知 ---
 @tasks.loop(minutes=1)
 async def check_booth_job():
     headers = {
@@ -293,17 +293,9 @@ async def check_booth_job():
                                     ),
                                 )
                                 await db.commit()
-                                is_notified = 0
-                            else:
-                                is_notified = row[1]
-                                await db.execute(
-                                    "UPDATE tracked_items SET likes = ? WHERE item_id = ?",
-                                    (likes, item_id),
-                                )
-                                await db.commit()
 
-                            # 【テスト用一時変更】スキ数が0以上（＝未通知の新作）なら通知を飛ばす
-                            if likes >= 0 and is_notified == 0:
+                            # 【テスト用強制送信】既読フラグを無視して通知を飛ばす
+                            if likes >= 0:
                                 await broadcast_item(
                                     item_id,
                                     title,
@@ -344,7 +336,7 @@ async def broadcast_item(item_id, title, url, price, category, likes):
             channels = await cursor.fetchall()
 
     embed = discord.Embed(
-        title=f"❤️ スキ達成！ [{category}]（※テスト通知）",
+        title=f"❤️ スキ達成！ [{category}]（※テスト強制送信）",
         description=f"**[{title}]({url})**",
         color=0xFF6473,
     )
