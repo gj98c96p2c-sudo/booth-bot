@@ -179,8 +179,11 @@ class CategorySelectView(discord.ui.View):
 
         categories_display = ", ".join(self.select.values)
         await interaction.response.send_message(
-            f"✅ このチャンネルに **【{categories_display}】** の通知を設定したよ！",
+            f"✅ このチャンネル（ID: {channel_id}）に **【{categories_display}】** の通知を設定したよ！",
             ephemeral=True,
+        )
+        print(
+            f"📌 【チャンネル登録完了】Channel ID: {channel_id} に {categories_display} を保存しました"
         )
 
 
@@ -224,12 +227,25 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-# --- 【テスト用】1分ごと＆既読無視の強制通知 ---
+# --- 1分ごとのBOOTH巡回（デバッグログ強化版） ---
 @tasks.loop(minutes=1)
 async def check_booth_job():
+    print("\n🔍 --- 【1分巡回スタート】BOOTHのチェックを開始します ---")
+
+    # 登録チャンネル数のチェック
+    async with aiosqlite.connect("bot_data.db") as db:
+        async with db.execute("SELECT COUNT(*) FROM channels") as cursor:
+            channel_count = (await cursor.fetchone())[0]
+
+    print(f"📊 現在データベースに登録されている通知先チャンネル数: {channel_count} 件")
+    if channel_count == 0:
+        print(
+            "⚠️ 【警告】送信先チャンネルが 0 件です！Discordで /set-channel を実行してください！"
+        )
+
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
     }
 
@@ -239,12 +255,17 @@ async def check_booth_job():
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=15)
                 ) as response:
+                    print(f"🌐 [{cat_name}] HTTPステータス: {response.status}")
                     if response.status != 200:
+                        print(
+                            f"⚠️ [{cat_name}] アクセス失敗（ステータスコード: {response.status}）"
+                        )
                         continue
                     html = await response.text()
 
                 soup = bs4.BeautifulSoup(html, "html.parser")
                 items = soup.select("li.item-card")
+                print(f"📦 [{cat_name}] BOOTHから取得できたアイテム数: {len(items)} 件")
 
                 async with aiosqlite.connect("bot_data.db") as db:
                     for item in items:
@@ -294,7 +315,7 @@ async def check_booth_job():
                                 )
                                 await db.commit()
 
-                            # 【テスト用強制送信】既読フラグを無視して通知を飛ばす
+                            # テスト用：常に通知送信を試みる
                             if likes >= 0:
                                 await broadcast_item(
                                     item_id,
@@ -310,22 +331,12 @@ async def check_booth_job():
                                 )
                                 await db.commit()
 
-                        except Exception:
+                        except Exception as e:
+                            print(f"⚠️ アイテム解析エラー: {e}")
                             continue
 
             except Exception as e:
-                print(f"[{cat_name}] 巡回通信エラー: {e}")
-
-    try:
-        seven_days_ago = datetime.datetime.now() - datetime.timedelta(days=7)
-        async with aiosqlite.connect("bot_data.db") as db:
-            await db.execute(
-                "DELETE FROM tracked_items WHERE created_at < ? AND notified = 0",
-                (seven_days_ago,),
-            )
-            await db.commit()
-    except Exception as e:
-        print(f"お掃除エラー: {e}")
+                print(f"❌ [{cat_name}] 巡回通信エラー: {e}")
 
 
 async def broadcast_item(item_id, title, url, price, category, likes):
@@ -335,8 +346,11 @@ async def broadcast_item(item_id, title, url, price, category, likes):
         ) as cursor:
             channels = await cursor.fetchall()
 
+    if not channels:
+        return
+
     embed = discord.Embed(
-        title=f"❤️ スキ達成！ [{category}]（※テスト強制送信）",
+        title=f"❤️ スキ達成！ [{category}]（※テスト強制限通知）",
         description=f"**[{title}]({url})**",
         color=0xFF6473,
     )
@@ -347,22 +361,30 @@ async def broadcast_item(item_id, title, url, price, category, likes):
     for channel_id, categories_str in channels:
         cat_list = categories_str.split(",")
         if category in cat_list:
+            # キャッシュにない場合も直接Discord APIからチャンネルを取得する（重要）
             channel = bot.get_channel(channel_id)
+            if not channel:
+                try:
+                    channel = await bot.fetch_channel(channel_id)
+                except Exception as e:
+                    print(
+                        f"⚠️ チャンネル取得エラー (ID: {channel_id}): {e}"
+                    )
+                    continue
+
             if channel:
                 try:
                     await channel.send(embed=embed)
+                    print(
+                        f"🚀 【送信成功】#{channel.name} に 「{title[:15]}...」 を通知しました！"
+                    )
                     await asyncio.sleep(0.2)
                 except discord.Forbidden:
-                    pass
-                except discord.NotFound:
-                    async with aiosqlite.connect("bot_data.db") as db:
-                        await db.execute(
-                            "DELETE FROM channels WHERE channel_id = ?",
-                            (channel_id,),
-                        )
-                        await db.commit()
-                except Exception:
-                    pass
+                    print(
+                        f"❌ 【送信失敗】#{channel.name} へのメッセージ送信権限がありません！"
+                    )
+                except Exception as e:
+                    print(f"❌ 【送信エラー】#{channel.name}: {e}")
 
 
 @bot.event
