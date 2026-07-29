@@ -46,6 +46,145 @@ MAX_RETRIES = 3                 # HTTPリトライ回数
 RETRY_BASE_DELAY = 2            # リトライの基底秒数
 FAILURE_ALERT_THRESHOLD = 3     # 何回連続で失敗したら警告を出すか
 
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+
+
+def _turso_pipeline_url(database_url: str) -> str:
+    """libsql:// URL を HTTPS pipeline URL に変換する。"""
+    if database_url.startswith("libsql://"):
+        database_url = "https://" + database_url[len("libsql://"):]
+    return database_url.rstrip("/") + "/v2/pipeline"
+
+
+def _convert_param(value):
+    """Turso に送る前に値を型付きオブジェクトに変換する。"""
+    if isinstance(value, bool):
+        return {"type": "integer", "value": str(int(value))}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": value}
+    if isinstance(value, datetime.datetime):
+        return {"type": "text", "value": value.isoformat()}
+    if value is None:
+        return {"type": "null"}
+    return {"type": "text", "value": str(value)}
+
+
+def _parse_cell(cell):
+    """Turso が返すセルを Python の値に変換する。"""
+    if not isinstance(cell, dict):
+        return cell
+    ctype = cell.get("type")
+    value = cell.get("value")
+    if ctype == "integer":
+        return int(value)
+    if ctype == "float":
+        return float(value)
+    if ctype == "null":
+        return None
+    return value
+
+
+class TursoCursor:
+    """Turso HTTP API の結果を aiosqlite っぽく使えるカーソル。"""
+
+    def __init__(self, result: dict):
+        self._result = result
+        self._cols = [col.get("name", "") for col in result.get("cols", [])]
+        self._rows = result.get("rows", [])
+        self._index = 0
+        self.rowcount = result.get("affected_row_count", 0)
+        self.lastrowid = result.get("last_insert_rowid")
+
+    async def fetchone(self):
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return tuple(_parse_cell(cell) for cell in row)
+
+    async def fetchall(self):
+        rows = self._rows[self._index:]
+        self._index = len(self._rows)
+        return [tuple(_parse_cell(cell) for cell in row) for row in rows]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class TursoClient:
+    """Turso データベースへの非同期 HTTP クライアント。"""
+
+    def __init__(self, database_url: str, auth_token: str):
+        self.url = _turso_pipeline_url(database_url)
+        self.token = auth_token
+        self._session: aiohttp.ClientSession | None = None
+
+    async def __aenter__(self):
+        self._session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._session:
+            await self._session.close()
+            self._session = None
+        return False
+
+    async def execute(self, sql: str, parameters=None):
+        """1つのSQLを実行して、aiosqlite風カーソルを返す。"""
+        if self._session is None:
+            raise RuntimeError("TursoClient は async with の中で使ってね")
+        stmt: dict = {"sql": sql}
+        if parameters:
+            stmt["args"] = [_convert_param(p) for p in parameters]
+        payload = {"requests": [{"type": "execute", "stmt": stmt}]}
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+        async with self._session.post(self.url, headers=headers, json=payload) as resp:
+            data = await resp.json()
+            result = data["results"][0]
+            if result["type"] == "error":
+                error = result.get("error", {})
+                raise Exception(f"Turso error: {error}")
+            return TursoCursor(result["response"]["result"])
+
+    async def commit(self):
+        """Turso HTTP API は各リクエストが自動コミットなので何もしない。"""
+        pass
+
+    async def batch(self, sql_statements: list):
+        """複数のSQLをまとめて実行する（テーブル作成用）。"""
+        if self._session is None:
+            raise RuntimeError("TursoClient は async with の中で使ってね")
+        requests = []
+        for stmt in sql_statements:
+            if isinstance(stmt, str):
+                requests.append({"type": "execute", "stmt": {"sql": stmt}})
+            else:
+                sql, params = stmt
+                requests.append({"type": "execute", "stmt": {"sql": sql, "args": [_convert_param(p) for p in params]}})
+        payload = {"requests": requests}
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+        async with self._session.post(self.url, headers=headers, json=payload) as resp:
+            return await resp.json()
+
+
+def db_connect():
+    """Turso が設定されていれば Turso、なければローカルの SQLite を使う。"""
+    if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
+        return TursoClient(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
+    return aiosqlite.connect(DB_PATH)
+
 
 # カテゴリ名からユーザー向けラベル（衣装/髪/小物/ギミック）を返す
 def map_category_label(category_name: str) -> str | None:
@@ -112,7 +251,7 @@ class MyBot(commands.Bot):
 
     async def init_db(self):
         """DBテーブルを初期化する。既存テーブル互換を維持する。"""
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect() as db:
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS channels (
                     channel_id INTEGER PRIMARY KEY,
@@ -394,7 +533,7 @@ class CategorySelectView(discord.ui.View):
         channel_id = interaction.channel_id
         guild_id = interaction.guild_id
 
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect() as db:
             await db.execute("""
                 INSERT OR REPLACE INTO channels (channel_id, guild_id, categories)
                 VALUES (?, ?, ?)
@@ -432,7 +571,7 @@ async def set_channel_error(interaction: discord.Interaction, error):
 @bot.tree.command(name="remove-channel", description="このチャンネルの通知設定を解除します")
 @app_commands.checks.has_permissions(manage_channels=True)
 async def remove_channel(interaction: discord.Interaction):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_connect() as db:
         await db.execute("DELETE FROM channels WHERE channel_id = ?", (interaction.channel_id,))
         await db.commit()
     await interaction.response.send_message(
@@ -450,7 +589,7 @@ async def filter_command(
     channel_id = interaction.channel_id
 
     if action == "list":
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect() as db:
             filters = await load_channel_filters(db, channel_id)
         if not filters:
             await interaction.response.send_message(
@@ -481,7 +620,7 @@ async def filter_command(
         )
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_connect() as db:
         if action == "add":
             try:
                 await db.execute(
@@ -531,7 +670,7 @@ async def set_nsfw(
     channel_id = interaction.channel_id
     allow = 1 if mode == "allow" else 0
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_connect() as db:
         # チャンネル登録が無くても設定できるように、INSERT OR REPLACE
         await db.execute(
             """
@@ -554,7 +693,7 @@ async def set_nsfw(
 async def status(interaction: discord.Interaction):
     channel_id = interaction.channel_id
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT categories, allow_nsfw FROM channels WHERE channel_id = ?",
             (channel_id,),
@@ -748,7 +887,7 @@ async def run_check_booth_job():
             return False
 
         # 2. 各商品のJSONを取得して処理
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_connect() as db:
             new_items: list[dict] = []
 
             for item_id in all_item_ids:
@@ -842,7 +981,7 @@ async def check_booth_job():
     定期的にBOOTHを巡回して新作を通知する。
     失敗が続いたら自己申告で警告を出す。
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_connect() as db:
         failure_count = await get_failure_count(db)
 
         try:
