@@ -780,7 +780,7 @@ async def test_notify(interaction: discord.Interaction):
         )
         await db.commit()
 
-        await notify_channels(db, test_item)
+        await broadcast_item(test_item, db)
 
         # テスト用に登録したチャンネル設定を削除（元からあった場合は削除しない方がいいが、テストコマンドなので削除）
         await db.execute("DELETE FROM channels WHERE channel_id = ?", (target_channel_id,))
