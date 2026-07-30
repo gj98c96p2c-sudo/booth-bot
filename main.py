@@ -90,7 +90,8 @@ def _parse_cell(cell):
 class TursoCursor:
     """Turso HTTP API の結果を aiosqlite っぽく使えるカーソル。
 
-    aiosqlite と同じく ``async with db.execute(...) as cursor:`` で使えるよう、
+    aiosqlite と同じく ``async with db.execute(...) as cursor:`` でも
+    ``cursor = await db.execute(...)`` でも使えるよう、
     ``execute`` 自体は同期メソッドとして即座にカーソルを返し、
     実際の HTTP リクエストはカーソルが使われるタイミングで await する。
     """
@@ -124,6 +125,13 @@ class TursoCursor:
         self._start_fetch()
         if self._fetch_task is not None:
             await self._fetch_task
+
+    def __await__(self):
+        """await db.execute(...) でも使えるようにする。"""
+        async def _resolve():
+            await self._ensure_loaded()
+            return self
+        return _resolve().__await__()
 
     async def fetchone(self):
         await self._ensure_loaded()
