@@ -88,9 +88,31 @@ def _parse_cell(cell):
 
 
 class TursoCursor:
-    """Turso HTTP API の結果を aiosqlite っぽく使えるカーソル。"""
+    """Turso HTTP API の結果を aiosqlite っぽく使えるカーソル。
 
-    def __init__(self, result: dict):
+    aiosqlite と同じく ``async with db.execute(...) as cursor:`` で使えるよう、
+    ``execute`` 自体は同期メソッドとして即座にカーソルを返し、
+    実際の HTTP リクエストはカーソルが使われるタイミングで await する。
+    """
+
+    def __init__(self, client: "TursoClient", sql: str, parameters=None):
+        self._client = client
+        self._sql = sql
+        self._parameters = parameters
+        self._result: dict | None = None
+        self._cols: list[str] = []
+        self._rows: list[list] = []
+        self._index = 0
+        self.rowcount = 0
+        self.lastrowid = None
+        self._fetch_task: asyncio.Task | None = None
+
+    def _start_fetch(self):
+        if self._fetch_task is None:
+            self._fetch_task = asyncio.create_task(self._do_fetch())
+
+    async def _do_fetch(self):
+        result = await self._client._execute_request(self._sql, self._parameters)
         self._result = result
         self._cols = [col.get("name", "") for col in result.get("cols", [])]
         self._rows = result.get("rows", [])
@@ -98,7 +120,13 @@ class TursoCursor:
         self.rowcount = result.get("affected_row_count", 0)
         self.lastrowid = result.get("last_insert_rowid")
 
+    async def _ensure_loaded(self):
+        self._start_fetch()
+        if self._fetch_task is not None:
+            await self._fetch_task
+
     async def fetchone(self):
+        await self._ensure_loaded()
         if self._index >= len(self._rows):
             return None
         row = self._rows[self._index]
@@ -106,11 +134,13 @@ class TursoCursor:
         return tuple(_parse_cell(cell) for cell in row)
 
     async def fetchall(self):
+        await self._ensure_loaded()
         rows = self._rows[self._index:]
         self._index = len(self._rows)
         return [tuple(_parse_cell(cell) for cell in row) for row in rows]
 
     async def __aenter__(self):
+        await self._ensure_loaded()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -135,8 +165,8 @@ class TursoClient:
             self._session = None
         return False
 
-    async def execute(self, sql: str, parameters=None):
-        """1つのSQLを実行して、aiosqlite風カーソルを返す。"""
+    async def _execute_request(self, sql: str, parameters=None) -> dict:
+        """実際に Turso にリクエストし、生の result 辞書を返す。"""
         if self._session is None:
             raise RuntimeError("TursoClient は async with の中で使ってね")
         stmt: dict = {"sql": sql}
@@ -153,7 +183,11 @@ class TursoClient:
             if result["type"] == "error":
                 error = result.get("error", {})
                 raise Exception(f"Turso error: {error}")
-            return TursoCursor(result["response"]["result"])
+            return result["response"]["result"]
+
+    def execute(self, sql: str, parameters=None):
+        """aiosqlite 風に同期的にカーソルを返す。"""
+        return TursoCursor(self, sql, parameters)
 
     async def commit(self):
         """Turso HTTP API は各リクエストが自動コミットなので何もしない。"""
