@@ -1160,19 +1160,48 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
     if not channels:
         return
 
+    # カテゴリバッジ
+    badge_emojis = {"衣装": "👕", "髪": "💇", "小物": "🎀", "ギミック": "⚙️", "無料": "🆓"}
+    badges = " ".join(f"`{badge_emojis.get(label, '✨')} {label}`" for label in item_labels)
+
+    published_dt = datetime.datetime.fromisoformat(item["published_at"])
+
     embed = discord.Embed(
-        title=f"✨ 新着入荷！ [{', '.join(item_labels)}]",
-        description=f"**[{item['title']}]({item['url']})**",
-        color=0xFF6473,
-        timestamp=datetime.datetime.fromisoformat(item["published_at"]),
+        description=(
+            f"{badges}\n\n"
+            f"**[{item['title']}]({item['url']})**\n"
+            f"{item['shop_name'] or '不明'}"
+        ),
+        color=0xFF6B8A,
+        timestamp=published_dt,
     )
-    embed.add_field(name="価格", value=item["price"], inline=True)
-    embed.add_field(name="スキ数", value=f"❤️ {item['likes']}", inline=True)
-    embed.add_field(name="ショップ", value=item["shop_name"] or "不明", inline=True)
-    embed.set_footer(text="BOOTH新作監視Bot")
+    embed.add_field(name="💰 価格", value=item["price"], inline=True)
+    embed.add_field(name="❤️ スキ", value=f"{item['likes']}", inline=True)
+    embed.add_field(name="🏪 ショップ", value=f"[見る]({item['shop_url']})", inline=True)
+    embed.set_footer(text="BOOTH新作監視Bot", icon_url=bot.user.display_avatar.url if bot.user else None)
 
     if item["image_url"]:
         embed.set_image(url=item["image_url"])
+
+    # ボタン付きView
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="BOOTHで見る",
+            url=item["url"],
+            style=discord.ButtonStyle.link,
+            emoji="🛒",
+        )
+    )
+    if item.get("shop_url"):
+        view.add_item(
+            discord.ui.Button(
+                label="ショップを見る",
+                url=item["shop_url"],
+                style=discord.ButtonStyle.link,
+                emoji="🏪",
+            )
+        )
 
     for channel_id, guild_id, categories_str, allow_nsfw in channels:
         channel = bot.get_channel(channel_id)
@@ -1222,15 +1251,20 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
             if not matched_filter:
                 continue
             embed.description = (
+                f"{badges}\n\n"
                 f"**[{item['title']}]({item['url']})**\n"
+                f"{item['shop_name'] or '不明'}\n"
                 f"🏷️ マッチしたフィルター: `{matched_filter}`"
             )
         else:
-            # フィルターが無い場合は元のdescriptionに戻す
-            embed.description = f"**[{item['title']}]({item['url']})**"
+            embed.description = (
+                f"{badges}\n\n"
+                f"**[{item['title']}]({item['url']})**\n"
+                f"{item['shop_name'] or '不明'}"
+            )
 
         try:
-            await channel.send(embed=embed)
+            await channel.send(embed=embed, view=view)
             print(f"🚀 【送信成功】#{channel.name} に 「{item['title'][:20]}...」 を通知")
             await asyncio.sleep(0.3)
         except discord.Forbidden:
