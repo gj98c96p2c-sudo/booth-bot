@@ -705,8 +705,53 @@ class FilterNameModal(discord.ui.Modal):
                     )
 
 
+class FilterDeleteButton(discord.ui.Button):
+    """登録済みフィルターを削除するボタン。"""
+
+    def __init__(self, target: Literal["avatar", "shop"], normalized_name: str, display_name: str):
+        self.target = target
+        self.normalized_name = normalized_name
+        super().__init__(
+            label=f"❌ {display_name[:20]}",
+            style=discord.ButtonStyle.danger,
+            row=0 if target == "avatar" else 1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        channel_id = interaction.channel_id
+        table_name = "filters" if self.target == "avatar" else "shop_filters"
+        target_label = "アバター名" if self.target == "avatar" else "ショップ名"
+
+        async with db_connect() as db:
+            cursor = await db.execute(
+                f"DELETE FROM {table_name} WHERE channel_id = ? AND normalized_name = ?",
+                (channel_id, self.normalized_name),
+            )
+            await db.commit()
+
+        if cursor.rowcount > 0:
+            await interaction.response.send_message(
+                f"❌ {target_label}「`{self.label[2:].strip()}`」を削除したよ。", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"⚠️ 既に削除されているよ。", ephemeral=True
+            )
+
+
+class FilterListView(discord.ui.View):
+    """登録済みフィルターをボタン付きで表示するビュー。"""
+
+    def __init__(self, avatar_filters: list[tuple[str, str]], shop_filters: list[tuple[str, str]]):
+        super().__init__(timeout=180)
+        for display_name, normalized in avatar_filters:
+            self.add_item(FilterDeleteButton("avatar", normalized, display_name))
+        for display_name, normalized in shop_filters:
+            self.add_item(FilterDeleteButton("shop", normalized, display_name))
+
+
 class FilterActionSelect(discord.ui.View):
-    """追加/削除/一覧を選ぶビュー。"""
+    """追加/一覧を選ぶビュー。削除は一覧のボタンで行う。"""
 
     def __init__(self):
         super().__init__(timeout=180)
@@ -716,32 +761,6 @@ class FilterActionSelect(discord.ui.View):
         await interaction.response.edit_message(
             content="追加するフィルターの種類を選んでね。",
             view=FilterTargetSelect("add"),
-        )
-
-    @discord.ui.button(label="➖ フィルターを削除", style=discord.ButtonStyle.danger)
-    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            content="削除するフィルターの種類を選んでね。",
-            view=FilterTargetSelect("remove"),
-        )
-
-    @discord.ui.button(label="📋 フィルター一覧", style=discord.ButtonStyle.secondary)
-    async def list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel_id = interaction.channel_id
-        async with db_connect() as db:
-            avatar_filters = await load_channel_filters(db, channel_id)
-            shop_filters = await load_channel_shop_filters(db, channel_id)
-
-        avatar_names = ", ".join([f"`{f[0]}`" for f in avatar_filters]) if avatar_filters else "未登録"
-        shop_names = ", ".join([f"`{f[0]}`" for f in shop_filters]) if shop_filters else "未登録"
-
-        await interaction.response.edit_message(
-            content=(
-                f"📌 このチャンネルのフィルター\n\n"
-                f"👤 アバター名（{len(avatar_filters)}件）:\n{avatar_names}\n\n"
-                f"🏪 ショップ名（{len(shop_filters)}件）:\n{shop_names}"
-            ),
-            view=None,
         )
 
 
@@ -763,9 +782,30 @@ class FilterTargetSelect(discord.ui.View):
 
 @bot.tree.command(name="filter", description="アバター名/ショップ名のフィルターを管理します")
 async def filter_command(interaction: discord.Interaction):
+    channel_id = interaction.channel_id
+    async with db_connect() as db:
+        avatar_filters = await load_channel_filters(db, channel_id)
+        shop_filters = await load_channel_shop_filters(db, channel_id)
+
+    if not avatar_filters and not shop_filters:
+        await interaction.response.send_message(
+            "📭 このチャンネルにはフィルターが登録されていないよ。\n"
+            "「➕ フィルターを追加」ボタンから追加してね。",
+            view=FilterActionSelect(),
+            ephemeral=True,
+        )
+        return
+
+    lines = ["📌 このチャンネルのフィルター一覧"]
+    if avatar_filters:
+        lines.append(f"\n👤 アバター名（{len(avatar_filters)}件）")
+    if shop_filters:
+        lines.append(f"\n🏪 ショップ名（{len(shop_filters)}件）")
+    lines.append("\n❌ ボタンを押すとそのフィルターを削除できるよ。")
+
     await interaction.response.send_message(
-        "フィルター管理メニューだよ。やりたい操作を選んでね。",
-        view=FilterActionSelect(),
+        "\n".join(lines),
+        view=FilterListView(avatar_filters, shop_filters),
         ephemeral=True,
     )
 
