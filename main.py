@@ -740,18 +740,32 @@ class FilterDeleteButton(discord.ui.Button):
 
 
 class FilterListView(discord.ui.View):
-    """登録済みフィルターをボタン付きで表示するビュー。"""
+    """登録済みフィルターをボタン付きで表示するビュー。追加ボタンも含む。"""
 
     def __init__(self, avatar_filters: list[tuple[str, str]], shop_filters: list[tuple[str, str]]):
         super().__init__(timeout=180)
+        self.add_item(FilterAddMenuButton())
         for display_name, normalized in avatar_filters:
             self.add_item(FilterDeleteButton("avatar", normalized, display_name))
         for display_name, normalized in shop_filters:
             self.add_item(FilterDeleteButton("shop", normalized, display_name))
 
 
+class FilterAddMenuButton(discord.ui.Button):
+    """フィルター追加用の選択画面を開くボタン。"""
+
+    def __init__(self):
+        super().__init__(label="➕ フィルターを追加", style=discord.ButtonStyle.primary, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content="追加するフィルターの種類を選んでね。",
+            view=FilterTargetSelect("add"),
+        )
+
+
 class FilterActionSelect(discord.ui.View):
-    """追加/一覧を選ぶビュー。削除は一覧のボタンで行う。"""
+    """フィルターが未登録の時に表示する追加ボタンのみのビュー。"""
 
     def __init__(self):
         super().__init__(timeout=180)
