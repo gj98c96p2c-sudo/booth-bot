@@ -336,6 +336,16 @@ class MyBot(commands.Bot):
             except Exception:
                 pass
 
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS shop_filters (
+                    filter_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id INTEGER NOT NULL,
+                    shop_name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    UNIQUE(channel_id, normalized_name)
+                )
+            """)
+
             # 自己申告用の状態管理テーブル
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
@@ -624,35 +634,40 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="filter", description="アバター名フィルターを管理します")
-@app_commands.describe(action="実行する操作", name="アバター名")
+@bot.tree.command(name="filter", description="アバター名またはショップ名のフィルターを管理します")
+@app_commands.describe(action="実行する操作", target="フィルターの対象", name="アバター名またはショップ名")
 async def filter_command(
     interaction: discord.Interaction,
     action: Literal["add", "remove", "list"],
+    target: Literal["avatar", "shop"] = "avatar",
     name: str = "",
 ):
     channel_id = interaction.channel_id
 
     if action == "list":
         async with db_connect() as db:
-            filters = await load_channel_filters(db, channel_id)
-        if not filters:
-            await interaction.response.send_message(
-                "📭 このチャンネルにはアバター名フィルターが登録されていないよ。",
-                ephemeral=True,
-            )
-            return
-        names = ", ".join([f"`{f[0]}`" for f in filters])
+            avatar_filters = await load_channel_filters(db, channel_id)
+            shop_filters = await load_channel_shop_filters(db, channel_id)
+
+        avatar_names = ", ".join([f"`{f[0]}`" for f in avatar_filters]) if avatar_filters else "未登録"
+        shop_names = ", ".join([f"`{f[0]}`" for f in shop_filters]) if shop_filters else "未登録"
+
         await interaction.response.send_message(
-            f"📌 このチャンネルに登録されたフィルター（{len(filters)}件）:\n{names}",
+            f"📌 このチャンネルのフィルター\n\n"
+            f"👤 アバター名（{len(avatar_filters)}件）:\n{avatar_names}\n\n"
+            f"🏪 ショップ名（{len(shop_filters)}件）:\n{shop_names}",
             ephemeral=True,
         )
         return
 
+    target_label = "アバター名" if target == "avatar" else "ショップ名"
+    table_name = "filters" if target == "avatar" else "shop_filters"
+    column_name = "avatar_name" if target == "avatar" else "shop_name"
+
     # add / remove は名前必須
     if not name.strip():
         await interaction.response.send_message(
-            "⚠️ アバター名を入力してね。例: `/filter add セレスティア`",
+            f"⚠️ {target_label}を入力してね。例: `/filter add {'セレスティア' if target == 'avatar' else 'テストショップ'}`",
             ephemeral=True,
         )
         return
@@ -669,39 +684,39 @@ async def filter_command(
         if action == "add":
             try:
                 await db.execute(
-                    """
-                    INSERT INTO filters (channel_id, avatar_name, normalized_name)
+                    f"""
+                    INSERT INTO {table_name} (channel_id, {column_name}, normalized_name)
                     VALUES (?, ?, ?)
                     """,
                     (channel_id, name.strip(), normalized),
                 )
                 await db.commit()
                 await interaction.response.send_message(
-                    f"✅ 「`{name.strip()}`」をフィルターに追加したよ！\n"
+                    f"✅ {target_label}「`{name.strip()}`」をフィルターに追加したよ！\n"
                     f"（正規化: `{normalized}`）",
                     ephemeral=True,
                 )
             except Exception as e:
                 print(f"フィルター追加エラー: {e}")
                 await interaction.response.send_message(
-                    f"⚠️ 「`{name.strip()}`」は既に登録されているか、登録できないよ。",
+                    f"⚠️ {target_label}「`{name.strip()}`」は既に登録されているか、登録できないよ。",
                     ephemeral=True,
                 )
 
         elif action == "remove":
             cursor = await db.execute(
-                "DELETE FROM filters WHERE channel_id = ? AND normalized_name = ?",
+                f"DELETE FROM {table_name} WHERE channel_id = ? AND normalized_name = ?",
                 (channel_id, normalized),
             )
             await db.commit()
             if cursor.rowcount > 0:
                 await interaction.response.send_message(
-                    f"❌ 「`{name.strip()}`」をフィルターから削除したよ。",
+                    f"❌ {target_label}「`{name.strip()}`」をフィルターから削除したよ。",
                     ephemeral=True,
                 )
             else:
                 await interaction.response.send_message(
-                    f"⚠️ 「`{name.strip()}`」は登録されていないよ。",
+                    f"⚠️ {target_label}「`{name.strip()}`」は登録されていないよ。",
                     ephemeral=True,
                 )
 
@@ -1140,9 +1155,18 @@ async def check_booth_job():
 
 
 async def load_channel_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str]]:
-    """チャンネルに登録されたフィルターを返す。"""
+    """チャンネルに登録されたアバター名フィルターを返す。"""
     async with db.execute(
         "SELECT avatar_name, normalized_name FROM filters WHERE channel_id = ?",
+        (channel_id,),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def load_channel_shop_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str]]:
+    """チャンネルに登録されたショップ名フィルターを返す。"""
+    async with db.execute(
+        "SELECT shop_name, normalized_name FROM shop_filters WHERE channel_id = ?",
         (channel_id,),
     ) as cursor:
         return await cursor.fetchall()
@@ -1177,7 +1201,7 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
     )
     embed.add_field(name="💰 価格", value=item["price"], inline=True)
     embed.add_field(name="❤️ スキ", value=f"{item['likes']}", inline=True)
-    embed.add_field(name="🏪 ショップ", value=f"[見る]({item['shop_url']})", inline=True)
+    embed.add_field(name="🏪 ショップ", value=item["shop_name"] or "不明", inline=True)
     embed.set_footer(text="BOOTH新作監視Bot", icon_url=bot.user.display_avatar.url if bot.user else None)
 
     if item["image_url"]:
@@ -1193,15 +1217,6 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
             emoji="🛒",
         )
     )
-    if item.get("shop_url"):
-        view.add_item(
-            discord.ui.Button(
-                label="ショップを見る",
-                url=item["shop_url"],
-                style=discord.ButtonStyle.link,
-                emoji="🏪",
-            )
-        )
 
     for channel_id, guild_id, categories_str, allow_nsfw in channels:
         channel = bot.get_channel(channel_id)
@@ -1238,30 +1253,45 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
             continue
 
         # アバター名フィルターチェック
-        filters = await load_channel_filters(db, channel_id)
-        if filters:
+        avatar_filters = await load_channel_filters(db, channel_id)
+        matched_avatar_filter = None
+        if avatar_filters:
             tag_names = json.loads(item["tags"]) if item["tags"] else []
             tag_names_normalized = [normalize_avatar_name(t) for t in tag_names]
-            matched_filter = None
-            for avatar_name, normalized_name in filters:
-                # 部分一致: タグの中にフィルター文字列が含まれるか
+            for avatar_name, normalized_name in avatar_filters:
                 if any(normalized_name in tag_norm for tag_norm in tag_names_normalized):
-                    matched_filter = avatar_name
+                    matched_avatar_filter = avatar_name
                     break
-            if not matched_filter:
-                continue
-            embed.description = (
-                f"{badges}\n\n"
-                f"**[{item['title']}]({item['url']})**\n"
-                f"{item['shop_name'] or '不明'}\n"
-                f"🏷️ マッチしたフィルター: `{matched_filter}`"
-            )
-        else:
-            embed.description = (
-                f"{badges}\n\n"
-                f"**[{item['title']}]({item['url']})**\n"
-                f"{item['shop_name'] or '不明'}"
-            )
+
+        # ショップ名フィルターチェック
+        shop_filters = await load_channel_shop_filters(db, channel_id)
+        matched_shop_filter = None
+        if shop_filters:
+            shop_name_normalized = normalize_avatar_name(item["shop_name"] or "")
+            for shop_name, normalized_name in shop_filters:
+                if normalized_name in shop_name_normalized:
+                    matched_shop_filter = shop_name
+                    break
+
+        # フィルターが登録されている場合、どちらかに一致しないと通知しない
+        if (avatar_filters or shop_filters) and not matched_avatar_filter and not matched_shop_filter:
+            continue
+
+        # description にマッチしたフィルターを表示
+        filter_lines = []
+        if matched_avatar_filter:
+            filter_lines.append(f"🏷️ アバター: `{matched_avatar_filter}`")
+        if matched_shop_filter:
+            filter_lines.append(f"🏪 ショップ: `{matched_shop_filter}`")
+        filter_text = "\n".join(filter_lines)
+
+        embed.description = (
+            f"{badges}\n\n"
+            f"**[{item['title']}]({item['url']})**\n"
+            f"{item['shop_name'] or '不明'}"
+        )
+        if filter_text:
+            embed.description += f"\n{filter_text}"
 
         try:
             await channel.send(embed=embed, view=view)
