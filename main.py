@@ -29,6 +29,9 @@ DB_PATH = "bot_data.db"
 ADMIN_CHANNEL_ID_RAW = os.getenv("ADMIN_CHANNEL_ID", "")
 ADMIN_CHANNEL_ID = int(ADMIN_CHANNEL_ID_RAW) if ADMIN_CHANNEL_ID_RAW.strip().lstrip("-").isdigit() else None
 
+BOT_TEST_CHANNEL_ID_RAW = os.getenv("BOT_TEST_CHANNEL_ID", "")
+BOT_TEST_CHANNEL_ID = int(BOT_TEST_CHANNEL_ID_RAW) if BOT_TEST_CHANNEL_ID_RAW.strip().lstrip("-").isdigit() else None
+
 CATEGORY_LABELS = {
     "衣装": ["3D衣装"],
     "髪": ["3D髪型", "3D髪"],
@@ -729,6 +732,75 @@ async def set_nsfw(
         f"🔞 このチャンネルでのR-18商品通知を **{status_text}** に設定したよ。",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="test-notify", description="テスト用の新着通知を1件送信します")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def test_notify(interaction: discord.Interaction):
+    """テスト用の架空商品で通知メッセージを1件送信する。"""
+    test_item = {
+        "item_id": "99999999",
+        "title": "【テスト】BOOTH通知Bot テスト用アバター衣装",
+        "url": "https://booth.pm/ja/items/99999999",
+        "price": "¥ 0",
+        "likes": 42,
+        "shop_name": "テストショップ",
+        "shop_url": "https://booth.pm/ja/shops/00000000",
+        "image_url": "https://booth.pximg.net/8f4cf23d-15cf-42f8-91e8-8c84bcdf8e39/i/8571315/full_size.jpg",
+        "published_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "category_name": "衣装",
+        "is_adult": False,
+        "tags": json.dumps(["アバター衣装", "テスト", "VRChat"]),
+    }
+
+    target_channel_id = BOT_TEST_CHANNEL_ID or interaction.channel_id
+    target_channel = bot.get_channel(target_channel_id)
+    if not target_channel:
+        try:
+            target_channel = await bot.fetch_channel(target_channel_id)
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ 通知先チャンネルの取得に失敗しました: {e}", ephemeral=True
+            )
+            return
+
+    async with db_connect() as db:
+        # 通知テンプレートを流用するため、一時的にDBに対象チャンネルを登録
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO channels (channel_id, guild_id, categories, allow_nsfw)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                target_channel_id,
+                getattr(target_channel, "guild", None) and target_channel.guild.id,
+                "衣装,無料",
+                0,
+            ),
+        )
+        await db.commit()
+
+        await notify_channels(db, test_item)
+
+        # テスト用に登録したチャンネル設定を削除（元からあった場合は削除しない方がいいが、テストコマンドなので削除）
+        await db.execute("DELETE FROM channels WHERE channel_id = ?", (target_channel_id,))
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"✅ テスト通知を <#{target_channel_id}> に送信しました。", ephemeral=True
+    )
+
+
+@test_notify.error
+async def test_notify_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ このコマンドを使うには `チャンネル管理` 権限が必要です。", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"❌ エラーが発生しました: {error}", ephemeral=True
+        )
 
 
 @bot.tree.command(name="status", description="このチャンネルの設定状態を確認します")
