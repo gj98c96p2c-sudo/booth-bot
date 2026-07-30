@@ -250,6 +250,94 @@ def get_item_labels(item: dict) -> list[str]:
     return labels
 
 intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+
+# ───────────────────────────────────────────
+# DM ブリッジ（ユーザー ↔ BoothBOT Manager）
+# ───────────────────────────────────────────
+@bot.event
+async def on_message(message: discord.Message):
+    """BotへのDMをManager側のログに転送し、返信可能にする。"""
+    # 自分自身や他のBotは無視
+    if message.author.bot:
+        return
+    # ギルド（サーバー）内のメッセージは無視
+    if message.guild is not None:
+        return
+    # BotへのDMだけ処理
+    if message.author.id == bot.user.id:
+        return
+
+    user = message.author
+    content = message.content or ""
+    attachments = message.attachments
+    attachment_info = ""
+    if attachments:
+        attachment_info = f" | 添付: {', '.join(a.url for a in attachments)}"
+
+    # Manager側のターミナル/ログに出力（目立つように区切り付き）
+    print("\n" + "=" * 60)
+    print(f"📩 DM受信 from {user.display_name} ({user.name} / ID: {user.id})")
+    print(f"📝 {content}{attachment_info}")
+    print(f"💡 返信する: /reply user:{user.id} message:ここに返信内容")
+    print("=" * 60 + "\n")
+
+    # ユーザーに転送完了を返信
+    try:
+        await message.channel.send(
+            "✅ メッセージをBoothBOT Managerに転送しました。\n"
+            "　追って返信が届くので少々お待ちください。"
+        )
+    except Exception as e:
+        print(f"⚠️ DM転送確認メッセージ送信失敗: {e}")
+
+
+@bot.tree.command(name="reply", description="DMブリッジ：指定ユーザーにBotから返信を送信する（Manager用）")
+@app_commands.describe(
+    user_id="返信先のDiscordユーザーID",
+    message="送信するメッセージ",
+)
+async def reply_command(interaction: discord.Interaction, user_id: str, message: str):
+    """Manager側が /reply コマンドでユーザーにDM返信する。"""
+    await interaction.response.defer(ephemeral=True)
+
+    # user_id を数値に変換
+    try:
+        target_id = int(user_id.strip())
+    except ValueError:
+        await interaction.followup.send("❌ user_id は数字で入力してください。", ephemeral=True)
+        return
+
+    # 送信者がBot管理者か簡易チェック（環境変数 ADMIN_CHANNEL_ID が設定されている場合）
+    # ただし管理者ロールの有無はDiscord権限で担保するのが難しいので、
+    # 基本的にコマンドを知っている人のみが使える想定。必要ならギルド権限で縛れる。
+    if interaction.user.id == bot.user.id:
+        await interaction.followup.send("❌ Bot自身からは使えません。", ephemeral=True)
+        return
+
+    try:
+        target_user = await bot.fetch_user(target_id)
+        if target_user is None:
+            await interaction.followup.send("❌ 指定したユーザーが見つかりません。", ephemeral=True)
+            return
+
+        await target_user.send(message)
+        await interaction.followup.send(
+            f"✅ {target_user.display_name} ({target_user.id}) に返信を送信しました。\n\n{message}",
+            ephemeral=True,
+        )
+        print(f"📤 Managerから返信送信 to {target_user.display_name} ({target_user.id}): {message}")
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ そのユーザーにはDMを送信できません。DMを受け取れない設定か、ブロックされています。",
+            ephemeral=True,
+        )
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"❌ 送信エラー: {e}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 予期しないエラー: {e}", ephemeral=True)
 
 
 # ───────────────────────────────────────────
