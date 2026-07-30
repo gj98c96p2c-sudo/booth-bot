@@ -634,17 +634,100 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="filter", description="アバター名またはショップ名のフィルターを管理します")
-@app_commands.describe(action="実行する操作", target="フィルターの対象", name="アバター名またはショップ名")
-async def filter_command(
-    interaction: discord.Interaction,
-    action: Literal["add", "remove", "list"],
-    target: Literal["avatar", "shop"] = "avatar",
-    name: str = "",
-):
-    channel_id = interaction.channel_id
+class FilterNameModal(discord.ui.Modal):
+    """アバター名/ショップ名フィルター用モーダル。"""
 
-    if action == "list":
+    name = discord.ui.TextInput(
+        label="名前",
+        placeholder="例: セレスティア",
+        required=True,
+        max_length=100,
+    )
+
+    def __init__(self, target: Literal["avatar", "shop"], action: Literal["add", "remove"]):
+        self.target = target
+        self.action = action
+        target_label = "アバター名" if target == "avatar" else "ショップ名"
+        action_label = "追加" if action == "add" else "削除"
+        super().__init__(title=f"{target_label}フィルターの{action_label}")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = interaction.channel_id
+        name_value = str(self.name).strip()
+        target_label = "アバター名" if self.target == "avatar" else "ショップ名"
+        table_name = "filters" if self.target == "avatar" else "shop_filters"
+        column_name = "avatar_name" if self.target == "avatar" else "shop_name"
+
+        normalized = normalize_avatar_name(name_value)
+        if not normalized:
+            await interaction.response.send_message(
+                "⚠️ その名前ではフィルター登録できないよ。", ephemeral=True
+            )
+            return
+
+        async with db_connect() as db:
+            if self.action == "add":
+                try:
+                    await db.execute(
+                        f"""
+                        INSERT INTO {table_name} (channel_id, {column_name}, normalized_name)
+                        VALUES (?, ?, ?)
+                        """,
+                        (channel_id, name_value, normalized),
+                    )
+                    await db.commit()
+                    await interaction.response.send_message(
+                        f"✅ {target_label}「`{name_value}`」をフィルターに追加したよ！\n"
+                        f"（正規化: `{normalized}`）",
+                        ephemeral=True,
+                    )
+                except Exception as e:
+                    print(f"フィルター追加エラー: {e}")
+                    await interaction.response.send_message(
+                        f"⚠️ {target_label}「`{name_value}`」は既に登録されているか、登録できないよ。",
+                        ephemeral=True,
+                    )
+            else:
+                cursor = await db.execute(
+                    f"DELETE FROM {table_name} WHERE channel_id = ? AND normalized_name = ?",
+                    (channel_id, normalized),
+                )
+                await db.commit()
+                if cursor.rowcount > 0:
+                    await interaction.response.send_message(
+                        f"❌ {target_label}「`{name_value}`」をフィルターから削除したよ。",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"⚠️ {target_label}「`{name_value}`」は登録されていないよ。",
+                        ephemeral=True,
+                    )
+
+
+class FilterActionSelect(discord.ui.View):
+    """追加/削除/一覧を選ぶビュー。"""
+
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="➕ フィルターを追加", style=discord.ButtonStyle.primary)
+    async def add_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="追加するフィルターの種類を選んでね。",
+            view=FilterTargetSelect("add"),
+        )
+
+    @discord.ui.button(label="➖ フィルターを削除", style=discord.ButtonStyle.danger)
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="削除するフィルターの種類を選んでね。",
+            view=FilterTargetSelect("remove"),
+        )
+
+    @discord.ui.button(label="📋 フィルター一覧", style=discord.ButtonStyle.secondary)
+    async def list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel_id = interaction.channel_id
         async with db_connect() as db:
             avatar_filters = await load_channel_filters(db, channel_id)
             shop_filters = await load_channel_shop_filters(db, channel_id)
@@ -652,73 +735,39 @@ async def filter_command(
         avatar_names = ", ".join([f"`{f[0]}`" for f in avatar_filters]) if avatar_filters else "未登録"
         shop_names = ", ".join([f"`{f[0]}`" for f in shop_filters]) if shop_filters else "未登録"
 
-        await interaction.response.send_message(
-            f"📌 このチャンネルのフィルター\n\n"
-            f"👤 アバター名（{len(avatar_filters)}件）:\n{avatar_names}\n\n"
-            f"🏪 ショップ名（{len(shop_filters)}件）:\n{shop_names}",
-            ephemeral=True,
+        await interaction.response.edit_message(
+            content=(
+                f"📌 このチャンネルのフィルター\n\n"
+                f"👤 アバター名（{len(avatar_filters)}件）:\n{avatar_names}\n\n"
+                f"🏪 ショップ名（{len(shop_filters)}件）:\n{shop_names}"
+            ),
+            view=None,
         )
-        return
 
-    target_label = "アバター名" if target == "avatar" else "ショップ名"
-    table_name = "filters" if target == "avatar" else "shop_filters"
-    column_name = "avatar_name" if target == "avatar" else "shop_name"
 
-    # add / remove は名前必須
-    if not name.strip():
-        await interaction.response.send_message(
-            f"⚠️ {target_label}を入力してね。例: `/filter add {'セレスティア' if target == 'avatar' else 'テストショップ'}`",
-            ephemeral=True,
-        )
-        return
+class FilterTargetSelect(discord.ui.View):
+    """アバター名/ショップ名を選ぶビュー。"""
 
-    normalized = normalize_avatar_name(name)
-    if not normalized:
-        await interaction.response.send_message(
-            "⚠️ その名前ではフィルター登録できないよ。",
-            ephemeral=True,
-        )
-        return
+    def __init__(self, action: Literal["add", "remove"]):
+        self.action = action
+        super().__init__(timeout=180)
 
-    async with db_connect() as db:
-        if action == "add":
-            try:
-                await db.execute(
-                    f"""
-                    INSERT INTO {table_name} (channel_id, {column_name}, normalized_name)
-                    VALUES (?, ?, ?)
-                    """,
-                    (channel_id, name.strip(), normalized),
-                )
-                await db.commit()
-                await interaction.response.send_message(
-                    f"✅ {target_label}「`{name.strip()}`」をフィルターに追加したよ！\n"
-                    f"（正規化: `{normalized}`）",
-                    ephemeral=True,
-                )
-            except Exception as e:
-                print(f"フィルター追加エラー: {e}")
-                await interaction.response.send_message(
-                    f"⚠️ {target_label}「`{name.strip()}`」は既に登録されているか、登録できないよ。",
-                    ephemeral=True,
-                )
+    @discord.ui.button(label="👤 アバター名", style=discord.ButtonStyle.primary)
+    async def avatar_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(FilterNameModal("avatar", self.action))
 
-        elif action == "remove":
-            cursor = await db.execute(
-                f"DELETE FROM {table_name} WHERE channel_id = ? AND normalized_name = ?",
-                (channel_id, normalized),
-            )
-            await db.commit()
-            if cursor.rowcount > 0:
-                await interaction.response.send_message(
-                    f"❌ {target_label}「`{name.strip()}`」をフィルターから削除したよ。",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(
-                    f"⚠️ {target_label}「`{name.strip()}`」は登録されていないよ。",
-                    ephemeral=True,
-                )
+    @discord.ui.button(label="🏪 ショップ名", style=discord.ButtonStyle.primary)
+    async def shop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(FilterNameModal("shop", self.action))
+
+
+@bot.tree.command(name="filter", description="アバター名/ショップ名のフィルターを管理します")
+async def filter_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "フィルター管理メニューだよ。やりたい操作を選んでね。",
+        view=FilterActionSelect(),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="set-nsfw", description="このチャンネルでのR-18商品通知を切り替えます")
