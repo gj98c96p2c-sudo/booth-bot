@@ -1,5 +1,28 @@
-__pycache__/
-*.pyc
-.DS_Store
+# 環境変数
+.env
+
+# ローカルDB
 bot_data.db
 bot_data.db-journal
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

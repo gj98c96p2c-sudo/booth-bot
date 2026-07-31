@@ -32,6 +32,9 @@ ADMIN_CHANNEL_ID = int(ADMIN_CHANNEL_ID_RAW) if ADMIN_CHANNEL_ID_RAW.strip().lst
 BOT_TEST_CHANNEL_ID_RAW = os.getenv("BOT_TEST_CHANNEL_ID", "")
 BOT_TEST_CHANNEL_ID = int(BOT_TEST_CHANNEL_ID_RAW) if BOT_TEST_CHANNEL_ID_RAW.strip().lstrip("-").isdigit() else None
 
+MANAGER_USER_ID_RAW = os.getenv("MANAGER_USER_ID", "")
+MANAGER_USER_ID = int(MANAGER_USER_ID_RAW) if MANAGER_USER_ID_RAW.strip().lstrip("-").isdigit() else None
+
 CATEGORY_LABELS = {
     "衣装": ["3D衣装"],
     "髪": ["3D髪型", "3D髪"],
@@ -273,16 +276,35 @@ async def on_message(message: discord.Message):
     user = message.author
     content = message.content or ""
     attachments = message.attachments
-    attachment_info = ""
-    if attachments:
-        attachment_info = f" | 添付: {', '.join(a.url for a in attachments)}"
+    attachment_urls = [a.url for a in attachments] if attachments else []
+    created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     # Manager側のターミナル/ログに出力（目立つように区切り付き）
     print("\n" + "=" * 60)
     print(f"📩 DM受信 from {user.display_name} ({user.name} / ID: {user.id})")
-    print(f"📝 {content}{attachment_info}")
+    print(f"📝 {content}")
+    if attachment_urls:
+        print(f"📎 添付: {', '.join(attachment_urls)}")
     print(f"💡 返信する: /reply user:{user.id} message:ここに返信内容")
     print("=" * 60 + "\n")
+
+    # DBに保存（外からも確認できるように）
+    try:
+        async with db_connect() as db:
+            await db.execute("""
+                INSERT INTO dm_inbox (user_id, username, display_name, content, attachments, created_at, replied)
+                VALUES (?, ?, ?, ?, ?, ?, 0)
+            """, (
+                user.id,
+                str(user.name),
+                str(user.display_name),
+                content,
+                json.dumps(attachment_urls, ensure_ascii=False),
+                created_at,
+            ))
+            await db.commit()
+    except Exception as e:
+        print(f"⚠️ DM保存失敗: {e}")
 
     # ユーザーに転送完了を返信
     try:
@@ -303,18 +325,23 @@ async def reply_command(interaction: discord.Interaction, user_id: str, message:
     """Manager側が /reply コマンドでユーザーにDM返信する。"""
     await interaction.response.defer(ephemeral=True)
 
+    # Manager権限チェック
+    if MANAGER_USER_ID is None:
+        await interaction.followup.send(
+            "❌ MANAGER_USER_ID が設定されていないので /reply は使用できません。", ephemeral=True
+        )
+        return
+    if interaction.user.id != MANAGER_USER_ID:
+        await interaction.followup.send(
+            "❌ このコマンドは BoothBOT Manager のみ使用できます。", ephemeral=True
+        )
+        return
+
     # user_id を数値に変換
     try:
         target_id = int(user_id.strip())
     except ValueError:
         await interaction.followup.send("❌ user_id は数字で入力してください。", ephemeral=True)
-        return
-
-    # 送信者がBot管理者か簡易チェック（環境変数 ADMIN_CHANNEL_ID が設定されている場合）
-    # ただし管理者ロールの有無はDiscord権限で担保するのが難しいので、
-    # 基本的にコマンドを知っている人のみが使える想定。必要ならギルド権限で縛れる。
-    if interaction.user.id == bot.user.id:
-        await interaction.followup.send("❌ Bot自身からは使えません。", ephemeral=True)
         return
 
     try:
@@ -381,6 +408,7 @@ class MyBot(commands.Bot):
         await self.tree.sync()
         print("✅ スラッシュコマンドの同期が完了しました")
         check_booth_job.start()
+        send_dm_replies.start()
 
     async def init_db(self):
         """DBテーブルを初期化する。既存テーブル互換を維持する。"""
@@ -439,6 +467,29 @@ class MyBot(commands.Bot):
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value TEXT
+                )
+            """)
+
+            # DMブリッジ用テーブル
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS dm_inbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    display_name TEXT,
+                    content TEXT NOT NULL,
+                    attachments TEXT,
+                    created_at TEXT NOT NULL,
+                    replied INTEGER DEFAULT 0
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS dm_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    sent_at TEXT
                 )
             """)
             await db.commit()
@@ -922,14 +973,14 @@ async def set_nsfw(
     allow = 1 if mode == "allow" else 0
 
     async with db_connect() as db:
-        # チャンネル登録が無くても設定できるように、INSERT OR REPLACE
+        # 既存の categories を保持しつつ、allow_nsfw のみ更新または新規登録
         await db.execute(
             """
             INSERT INTO channels (channel_id, guild_id, categories, allow_nsfw)
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, COALESCE((SELECT categories FROM channels WHERE channel_id = ?), ''), ?)
             ON CONFLICT(channel_id) DO UPDATE SET allow_nsfw = excluded.allow_nsfw
             """,
-            (channel_id, interaction.guild_id or 0, "", allow),
+            (channel_id, interaction.guild_id or 0, channel_id, allow),
         )
         await db.commit()
 
@@ -971,26 +1022,40 @@ async def test_notify(interaction: discord.Interaction):
             return
 
     async with db_connect() as db:
-        # 通知テンプレートを流用するため、一時的にDBに対象チャンネルを登録
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO channels (channel_id, guild_id, categories, allow_nsfw)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                target_channel_id,
-                getattr(target_channel, "guild", None) and target_channel.guild.id,
-                "衣装,無料",
-                0,
-            ),
-        )
-        await db.commit()
+        # 既存のチャンネル設定を保存しておく
+        async with db.execute(
+            "SELECT categories, allow_nsfw FROM channels WHERE channel_id = ?",
+            (target_channel_id,),
+        ) as cursor:
+            existing = await cursor.fetchone()
 
-        await broadcast_item(test_item, db)
+        if existing is None:
+            # 未登録の場合だけ一時的にテスト用カテゴリを登録
+            await db.execute(
+                """
+                INSERT INTO channels (channel_id, guild_id, categories, allow_nsfw)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    target_channel_id,
+                    getattr(target_channel, "guild", None) and target_channel.guild.id,
+                    "衣装,無料",
+                    0,
+                ),
+            )
+            await db.commit()
+            restore_needed = True
+        else:
+            # 既存設定がある場合は上書きしない
+            restore_needed = False
 
-        # テスト用に登録したチャンネル設定を削除（元からあった場合は削除しない方がいいが、テストコマンドなので削除）
-        await db.execute("DELETE FROM channels WHERE channel_id = ?", (target_channel_id,))
-        await db.commit()
+        try:
+            await broadcast_item(test_item, db)
+        finally:
+            # 一時的に登録した場合だけ削除
+            if restore_needed:
+                await db.execute("DELETE FROM channels WHERE channel_id = ?", (target_channel_id,))
+                await db.commit()
 
     await interaction.response.send_message(
         f"✅ テスト通知を <#{target_channel_id}> に送信しました。", ephemeral=True
@@ -1345,6 +1410,46 @@ async def check_booth_job():
             )
 
 
+@tasks.loop(minutes=1)
+async def send_dm_replies():
+    """dm_outbox に溜まった返信を各ユーザーにDM送信する。"""
+    try:
+        async with db_connect() as db:
+            async with db.execute(
+                "SELECT id, user_id, content FROM dm_outbox WHERE sent_at IS NULL ORDER BY id ASC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            for row_id, user_id, content in rows:
+                try:
+                    user = await bot.fetch_user(user_id)
+                    if user is None:
+                        print(f"⚠️ [dm_outbox] ユーザー取得失敗 (ID: {user_id})")
+                        continue
+                    await user.send(content)
+                    print(f"📤 [DMブリッジ] {user.display_name} ({user_id}) に返信送信")
+                    sent_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    await db.execute(
+                        "UPDATE dm_outbox SET sent_at = ? WHERE id = ?",
+                        (sent_at, row_id),
+                    )
+                    await db.commit()
+                    await asyncio.sleep(0.5)
+                except discord.Forbidden:
+                    print(f"❌ [DMブリッジ] {user_id} への送信権限なし。10分後に再試行。")
+                except discord.HTTPException as e:
+                    print(f"❌ [DMブリッジ] HTTPエラー: {e}")
+                except Exception as e:
+                    print(f"❌ [DMブリッジ] 送信失敗: {e}")
+    except Exception as e:
+        print(f"❌ [DMブリッジ] ポーリングエラー: {e}")
+
+
+@send_dm_replies.before_loop
+async def before_send_dm_replies():
+    await bot.wait_until_ready()
+
+
 async def load_channel_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str]]:
     """チャンネルに登録されたアバター名フィルターを返す。"""
     async with db.execute(
@@ -1393,7 +1498,10 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
     embed.add_field(name="💰 価格", value=item["price"], inline=True)
     embed.add_field(name="❤️ スキ", value=f"{item['likes']}", inline=True)
     embed.add_field(name="🏪 ショップ", value=item["shop_name"] or "不明", inline=True)
-    embed.set_footer(text="BOOTH新作監視Bot", icon_url=bot.user.display_avatar.url if bot.user else None)
+    embed.set_footer(
+        text="BOOTH新作監視Bot",
+        icon_url=(bot.user.display_avatar.url if bot.user and bot.user.display_avatar else None),
+    )
 
     if item["image_url"]:
         embed.set_image(url=item["image_url"])
