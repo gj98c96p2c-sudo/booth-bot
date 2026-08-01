@@ -1143,6 +1143,7 @@ def parse_item_json(item_id: str, data: dict, category_label: str) -> dict | Non
         "is_adult": 1 if data.get("is_adult") else 0,
         "published_at": published_at,
         "shop_name": data.get("shop", {}).get("name", "") if isinstance(data.get("shop"), dict) else "",
+        "shop_url": data.get("shop", {}).get("url", "") if isinstance(data.get("shop"), dict) else "",
         "tags": json.dumps(tags, ensure_ascii=False),
     }
 
@@ -1261,10 +1262,11 @@ async def run_check_booth_job():
             await db.commit()
             print(f"🆕 新作判定: {len(new_items)} 件")
 
-            # 3. 通知処理
+            # 3. 通知処理（フィルターは1回だけ読み込む）
+            all_avatar_filters, all_shop_filters = await load_all_channel_filters(db)
             for item in new_items:
                 try:
-                    await broadcast_item(item, db)
+                    await broadcast_item(item, db, all_avatar_filters, all_shop_filters)
                     await db.execute(
                         "UPDATE items SET notified_at = ? WHERE item_id = ?",
                         (now, item["item_id"]),
@@ -1385,7 +1387,29 @@ async def load_channel_shop_filters(db: aiosqlite.Connection, channel_id: int) -
         return await cursor.fetchall()
 
 
-async def broadcast_item(item: dict, db: aiosqlite.Connection):
+async def load_all_channel_filters(
+    db: aiosqlite.Connection,
+) -> tuple[dict[int, list[tuple[str, str]]], dict[int, list[tuple[str, str]]]]:
+    """全チャンネルのフィルターをまとめて読み込む（通知処理の高速化用）。"""
+    avatar_filters: dict[int, list[tuple[str, str]]] = {}
+    async with db.execute("SELECT channel_id, avatar_name, normalized_name FROM filters") as cursor:
+        async for row in cursor:
+            avatar_filters.setdefault(row[0], []).append((row[1], row[2]))
+
+    shop_filters: dict[int, list[tuple[str, str]]] = {}
+    async with db.execute("SELECT channel_id, shop_name, normalized_name FROM shop_filters") as cursor:
+        async for row in cursor:
+            shop_filters.setdefault(row[0], []).append((row[1], row[2]))
+
+    return avatar_filters, shop_filters
+
+
+async def broadcast_item(
+    item: dict,
+    db: aiosqlite.Connection,
+    all_avatar_filters: dict[int, list[tuple[str, str]]] | None = None,
+    all_shop_filters: dict[int, list[tuple[str, str]]] | None = None,
+):
     """対象チャンネルにEmbedを送信する。"""
     item_labels = get_item_labels(item)
     if not item_labels:
@@ -1413,7 +1437,6 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
         timestamp=published_dt,
     )
     embed.add_field(name="💰 価格", value=item["price"], inline=True)
-    embed.add_field(name="❤️ スキ", value=f"{item['likes']}", inline=True)
     embed.add_field(name="🏪 ショップ", value=item["shop_name"] or "不明", inline=True)
     embed.set_footer(
         text="BOOTH新作監視Bot",
@@ -1433,6 +1456,15 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
             emoji="🛒",
         )
     )
+    if item.get("shop_url"):
+        view.add_item(
+            discord.ui.Button(
+                label="ショップを見る",
+                url=item["shop_url"],
+                style=discord.ButtonStyle.link,
+                emoji="🏪",
+            )
+        )
 
     for channel_id, guild_id, categories_str, allow_nsfw in channels:
         channel = bot.get_channel(channel_id)
@@ -1469,7 +1501,10 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
             continue
 
         # アバター名フィルターチェック
-        avatar_filters = await load_channel_filters(db, channel_id)
+        if all_avatar_filters is not None:
+            avatar_filters = all_avatar_filters.get(channel_id, [])
+        else:
+            avatar_filters = await load_channel_filters(db, channel_id)
         matched_avatar_filter = None
         if avatar_filters:
             tag_names = json.loads(item["tags"]) if item["tags"] else []
@@ -1480,7 +1515,10 @@ async def broadcast_item(item: dict, db: aiosqlite.Connection):
                     break
 
         # ショップ名フィルターチェック
-        shop_filters = await load_channel_shop_filters(db, channel_id)
+        if all_shop_filters is not None:
+            shop_filters = all_shop_filters.get(channel_id, [])
+        else:
+            shop_filters = await load_channel_shop_filters(db, channel_id)
         matched_shop_filter = None
         if shop_filters:
             shop_name_normalized = normalize_avatar_name(item["shop_name"] or "")
