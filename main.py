@@ -35,7 +35,12 @@ from database import (
     TURSO_AUTH_TOKEN,
     TURSO_DATABASE_URL,
 )
-from utils import normalize_avatar_name
+from utils import (
+    MAX_FILTERS_PER_CHANNEL,
+    MAX_FILTER_NAME_LENGTH,
+    normalize_avatar_name,
+    validate_filter_name,
+)
 import logging_utils as log
 from booth import (
     CATEGORY_LABELS as BOOTH_CATEGORY_LABELS,
@@ -508,7 +513,7 @@ class FilterNameModal(discord.ui.Modal):
         label="名前",
         placeholder="例: セレスティア",
         required=True,
-        max_length=100,
+        max_length=MAX_FILTER_NAME_LENGTH,
     )
 
     def __init__(self, target: Literal["avatar", "shop"], action: Literal["add", "remove"]):
@@ -525,15 +530,28 @@ class FilterNameModal(discord.ui.Modal):
         table_name = "filters" if self.target == "avatar" else "shop_filters"
         column_name = "avatar_name" if self.target == "avatar" else "shop_name"
 
-        normalized = normalize_avatar_name(name_value)
-        if not normalized:
-            await interaction.response.send_message(
-                "⚠️ その名前ではフィルター登録できないよ。", ephemeral=True
-            )
+        normalized, error = validate_filter_name(name_value)
+        if error is not None:
+            await interaction.response.send_message(error, ephemeral=True)
             return
 
         async with db_connect() as db:
             if self.action == "add":
+                # 上限チェック
+                async with db.execute(
+                    f"SELECT COUNT(*) FROM {table_name} WHERE channel_id = ?",
+                    (channel_id,),
+                ) as cur:
+                    current_count = (await cur.fetchone())[0]
+                if current_count >= MAX_FILTERS_PER_CHANNEL:
+                    await interaction.response.send_message(
+                        f"⚠️ このチャンネルの{target_label}フィルターは上限"
+                        f"（{MAX_FILTERS_PER_CHANNEL}件）に達しているよ。\n"
+                        f"`/filter remove` でいくつか削除してから追加してね。",
+                        ephemeral=True,
+                    )
+                    return
+
                 try:
                     await db.execute(
                         f"""
@@ -545,11 +563,11 @@ class FilterNameModal(discord.ui.Modal):
                     await db.commit()
                     await interaction.response.send_message(
                         f"✅ {target_label}「`{name_value}`」をフィルターに追加したよ！\n"
-                        f"（正規化: `{normalized}`）",
+                        f"（正規化: `{normalized}` / {current_count + 1}/{MAX_FILTERS_PER_CHANNEL}件）",
                         ephemeral=True,
                     )
                 except Exception as e:
-                    log.info("on_submit", f"フィルター追加エラー: {e}")
+                    log.warn("on_submit", f"⚠️ フィルター追加エラー: {e}")
                     await interaction.response.send_message(
                         f"⚠️ {target_label}「`{name_value}`」は既に登録されているか、登録できないよ。",
                         ephemeral=True,

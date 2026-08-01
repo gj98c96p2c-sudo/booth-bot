@@ -29,3 +29,49 @@ def normalize_avatar_name(name: str) -> str:
     name = re.sub(r"[^\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf\u3400-\u4dbf\w]", "", name)
     name = name.replace("_", "")
     return name
+
+
+MAX_FILTERS_PER_CHANNEL = 50    # 1チャンネルあたりのフィルター上限
+MAX_FILTER_NAME_LENGTH = 50     # フィルター名の最大文字数
+MIN_FILTER_NAME_LENGTH = 2      # フィルター名の最小文字数（正規化後）
+
+
+def validate_filter_name(raw_name: str) -> tuple[str | None, str | None]:
+    """フィルター名を検証する。
+
+    Returns:
+        (normalized_name, error_message)
+        正常時は (正規化済み名前, None)、異常時は (None, エラーメッセージ)
+    """
+    name = raw_name.strip()
+
+    if not name:
+        return None, "⚠️ 名前が空だよ。"
+
+    if len(name) > MAX_FILTER_NAME_LENGTH:
+        return None, f"⚠️ 名前が長すぎるよ（{MAX_FILTER_NAME_LENGTH}文字以内にしてね）。"
+
+    # 制御文字・改行を含むものは拒否
+    if any(ord(c) < 32 or ord(c) == 127 for c in name):
+        return None, "⚠️ 使えない文字が含まれているよ。"
+
+    # URLらしきものは拒否
+    if "://" in name or name.lower().startswith("www."):
+        return None, "⚠️ URLはフィルターに登録できないよ。"
+
+    # Discordメンション/everyone は拒否
+    if "@everyone" in name or "@here" in name or "<@" in name:
+        return None, "⚠️ メンションはフィルターに登録できないよ。"
+
+    normalized = normalize_avatar_name(name)
+
+    if not normalized:
+        return None, "⚠️ その名前ではフィルター登録できないよ（記号だけの名前は使えないよ）。"
+
+    if len(normalized) < MIN_FILTER_NAME_LENGTH:
+        return None, (
+            f"⚠️ 名前が短すぎるよ（{MIN_FILTER_NAME_LENGTH}文字以上にしてね）。"
+            "通知が多くなりすぎちゃうよ。"
+        )
+
+    return normalized, None
