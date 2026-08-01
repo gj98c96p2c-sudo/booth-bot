@@ -23,6 +23,20 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from database import (
+    db_connect,
+    get_failure_count,
+    init_db,
+    load_all_channel_filters,
+    load_channel_filters,
+    load_channel_shop_filters,
+    set_failure_count,
+    validate_db_connection,
+    TURSO_AUTH_TOKEN,
+    TURSO_DATABASE_URL,
+)
+from utils import normalize_avatar_name
+
 # ───────────────────────────────────────────
 # 定数
 # ───────────────────────────────────────────
@@ -54,9 +68,6 @@ MAX_RETRIES = 3                 # HTTPリトライ回数
 RETRY_BASE_DELAY = 2            # リトライの基底秒数
 FAILURE_ALERT_THRESHOLD = 3     # 何回連続で失敗したら警告を出すか
 
-TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
-TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
-
 
 def validate_environment() -> list[str]:
     """必須・推奨環境変数をチェックし、問題のリストを返す。"""
@@ -72,200 +83,6 @@ def validate_environment() -> list[str]:
     if not TURSO_AUTH_TOKEN:
         issues.append("TURSO_AUTH_TOKEN が未設定（Renderではデータが揮発する可能性があります）")
     return issues
-
-
-def _turso_pipeline_url(database_url: str) -> str:
-    """libsql:// URL を HTTPS pipeline URL に変換する。"""
-    if database_url.startswith("libsql://"):
-        database_url = "https://" + database_url[len("libsql://"):]
-    return database_url.rstrip("/") + "/v2/pipeline"
-
-
-def _convert_param(value):
-    """Turso に送る前に値を型付きオブジェクトに変換する。"""
-    if isinstance(value, bool):
-        return {"type": "integer", "value": str(int(value))}
-    if isinstance(value, int):
-        return {"type": "integer", "value": str(value)}
-    if isinstance(value, float):
-        return {"type": "float", "value": value}
-    if isinstance(value, datetime.datetime):
-        return {"type": "text", "value": value.isoformat()}
-    if value is None:
-        return {"type": "null"}
-    return {"type": "text", "value": str(value)}
-
-
-def _parse_cell(cell):
-    """Turso が返すセルを Python の値に変換する。"""
-    if not isinstance(cell, dict):
-        return cell
-    ctype = cell.get("type")
-    value = cell.get("value")
-    if ctype == "integer":
-        return int(value)
-    if ctype == "float":
-        return float(value)
-    if ctype == "null":
-        return None
-    return value
-
-
-class TursoCursor:
-    """Turso HTTP API の結果を aiosqlite っぽく使えるカーソル。
-
-    aiosqlite と同じく ``async with db.execute(...) as cursor:`` でも
-    ``cursor = await db.execute(...)`` でも使えるよう、
-    ``execute`` 自体は同期メソッドとして即座にカーソルを返し、
-    実際の HTTP リクエストはカーソルが使われるタイミングで await する。
-    """
-
-    def __init__(self, client: "TursoClient", sql: str, parameters=None):
-        self._client = client
-        self._sql = sql
-        self._parameters = parameters
-        self._result: dict | None = None
-        self._cols: list[str] = []
-        self._rows: list[list] = []
-        self._index = 0
-        self.rowcount = 0
-        self.lastrowid = None
-        self._fetch_task: asyncio.Task | None = None
-
-    def _start_fetch(self):
-        if self._fetch_task is None:
-            self._fetch_task = asyncio.create_task(self._do_fetch())
-
-    async def _do_fetch(self):
-        result = await self._client._execute_request(self._sql, self._parameters)
-        self._result = result
-        self._cols = [col.get("name", "") for col in result.get("cols", [])]
-        self._rows = result.get("rows", [])
-        self._index = 0
-        self.rowcount = result.get("affected_row_count", 0)
-        self.lastrowid = result.get("last_insert_rowid")
-
-    async def _ensure_loaded(self):
-        self._start_fetch()
-        if self._fetch_task is not None:
-            await self._fetch_task
-
-    def __await__(self):
-        """await db.execute(...) でも使えるようにする。"""
-        async def _resolve():
-            await self._ensure_loaded()
-            return self
-        return _resolve().__await__()
-
-    async def fetchone(self):
-        await self._ensure_loaded()
-        if self._index >= len(self._rows):
-            return None
-        row = self._rows[self._index]
-        self._index += 1
-        return tuple(_parse_cell(cell) for cell in row)
-
-    async def fetchall(self):
-        await self._ensure_loaded()
-        rows = self._rows[self._index:]
-        self._index = len(self._rows)
-        return [tuple(_parse_cell(cell) for cell in row) for row in rows]
-
-    async def __aenter__(self):
-        await self._ensure_loaded()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class TursoClient:
-    """Turso データベースへの非同期 HTTP クライアント。"""
-
-    def __init__(self, database_url: str, auth_token: str):
-        self.url = _turso_pipeline_url(database_url)
-        self.token = auth_token
-        self._session: aiohttp.ClientSession | None = None
-
-    async def __aenter__(self):
-        self._session = aiohttp.ClientSession()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self._session:
-            await self._session.close()
-            self._session = None
-        return False
-
-    async def _execute_request(self, sql: str, parameters=None) -> dict:
-        """実際に Turso にリクエストし、生の result 辞書を返す。"""
-        if self._session is None:
-            raise RuntimeError("TursoClient は async with の中で使ってね")
-        stmt: dict = {"sql": sql}
-        if parameters:
-            stmt["args"] = [_convert_param(p) for p in parameters]
-        payload = {"requests": [{"type": "execute", "stmt": stmt}]}
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-        async with self._session.post(self.url, headers=headers, json=payload) as resp:
-            data = await resp.json()
-            result = data["results"][0]
-            if result["type"] == "error":
-                error = result.get("error", {})
-                raise Exception(f"Turso error: {error}")
-            return result["response"]["result"]
-
-    def execute(self, sql: str, parameters=None):
-        """aiosqlite 風に同期的にカーソルを返す。"""
-        return TursoCursor(self, sql, parameters)
-
-    async def commit(self):
-        """Turso HTTP API は各リクエストが自動コミットなので何もしない。"""
-        pass
-
-    async def batch(self, sql_statements: list):
-        """複数のSQLをまとめて実行する（テーブル作成用）。"""
-        if self._session is None:
-            raise RuntimeError("TursoClient は async with の中で使ってね")
-        requests = []
-        for stmt in sql_statements:
-            if isinstance(stmt, str):
-                requests.append({"type": "execute", "stmt": {"sql": stmt}})
-            else:
-                sql, params = stmt
-                requests.append({"type": "execute", "stmt": {"sql": sql, "args": [_convert_param(p) for p in params]}})
-        payload = {"requests": requests}
-        headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-        }
-        async with self._session.post(self.url, headers=headers, json=payload) as resp:
-            return await resp.json()
-
-
-def db_connect():
-    """Turso が設定されていれば Turso、なければローカルの SQLite を使う。"""
-    if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
-        print(f"🗄️ データベース: Turso ({TURSO_DATABASE_URL})")
-        return TursoClient(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
-    print(f"🗄️ データベース: ローカルSQLite ({DB_PATH})")
-    return aiosqlite.connect(DB_PATH)
-
-
-async def validate_db_connection() -> bool:
-    """DB接続を確認し、永続化できているか検証する。"""
-    try:
-        async with db_connect() as db:
-            await init_db(db)
-            async with db.execute("SELECT value FROM bot_state WHERE key = 'failure_count'") as cursor:
-                row = await cursor.fetchone()
-                print(f"✅ DB接続テスト成功 (failure_count={row[0] if row else 'N/A'})")
-                return True
-    except Exception as e:
-        print(f"❌ DB接続テスト失敗: {e}")
-        return False
 
 
 # カテゴリ名からユーザー向けラベル（衣装/髪/小物/ギミック）を返す
@@ -286,38 +103,10 @@ def get_item_labels(item: dict) -> list[str]:
         labels.append("無料")
     return labels
 
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-
-
-# ───────────────────────────────────────────
-# 文字列正規化（アバター名フィルター用）
-# ───────────────────────────────────────────
-_KATAKANA_TO_HIRAGANA = str.maketrans(
-    "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン"
-    "ガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポ"
-    "ァィゥェォャュョッヮ",
-    "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"
-    "がぎぐげござじずぜぞだぢづでどばびぶべぼぱぴぷぺぽ"
-    "ぁぃぅぇぉゃゅょっゎ",
-)
-
-
-def normalize_avatar_name(name: str) -> str:
-    """
-    アバター名を比較用に正規化する。
-    大文字小文字・ひらがなカタカナ・全角半角・記号空白を同一視する。
-    """
-    # 小文字化
-    name = name.lower()
-    # Unicode正規化（全角英数字→半角 など）
-    name = unicodedata.normalize("NFKC", name)
-    # カタカナ → ひらがな
-    name = name.translate(_KATAKANA_TO_HIRAGANA)
-    # 記号・空白を除去
-    name = re.sub(r"[^\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf\u3400-\u4dbf\w]", "", name)
-    return name
 
 
 # ───────────────────────────────────────────
@@ -328,129 +117,12 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.init_db()
+        async with db_connect() as db:
+            await init_db(db)
         await self.tree.sync()
         print("✅ スラッシュコマンドの同期が完了しました")
         check_booth_job.start()
         send_dm_replies.start()
-
-    async def init_db(self):
-        """DBテーブルを初期化する。既存テーブル互換を維持する。"""
-        async with db_connect() as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS channels (
-                    channel_id INTEGER PRIMARY KEY,
-                    guild_id INTEGER NOT NULL,
-                    categories TEXT NOT NULL,
-                    allow_nsfw INTEGER DEFAULT 0
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS items (
-                    item_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    price TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    likes INTEGER DEFAULT 0,
-                    image_url TEXT,
-                    is_adult INTEGER DEFAULT 0,
-                    published_at TIMESTAMP NOT NULL,
-                    shop_name TEXT,
-                    tags TEXT,
-                    notified_at TIMESTAMP
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS filters (
-                    filter_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    channel_id INTEGER NOT NULL,
-                    avatar_name TEXT NOT NULL,
-                    normalized_name TEXT NOT NULL,
-                    UNIQUE(channel_id, normalized_name)
-                )
-            """)
-            # 後方互換: normalized_name カラムが無い場合は追加
-            try:
-                await db.execute("ALTER TABLE filters ADD COLUMN normalized_name TEXT")
-            except Exception:
-                pass
-
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS shop_filters (
-                    filter_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    channel_id INTEGER NOT NULL,
-                    shop_name TEXT NOT NULL,
-                    normalized_name TEXT NOT NULL,
-                    UNIQUE(channel_id, normalized_name)
-                )
-            """)
-
-            # 自己申告用の状態管理テーブル
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-
-            # DMブリッジ用テーブル
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS dm_inbox (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    username TEXT,
-                    display_name TEXT,
-                    content TEXT NOT NULL,
-                    attachments TEXT,
-                    created_at TEXT NOT NULL,
-                    replied INTEGER DEFAULT 0
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS dm_outbox (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    sent_at TEXT
-                )
-            """)
-            await db.commit()
-
-            # bot_state に初期値を入れる
-            await db.execute("""
-                INSERT OR IGNORE INTO bot_state (key, value) VALUES ('failure_count', '0')
-            """)
-            await db.commit()
-
-
-# 連続失敗回数をDBから取得する
-async def get_failure_count(db: aiosqlite.Connection) -> int:
-    async with db.execute(
-        "SELECT value FROM bot_state WHERE key = 'failure_count'"
-    ) as cursor:
-        row = await cursor.fetchone()
-    if row is None:
-        await db.execute(
-            "INSERT OR IGNORE INTO bot_state (key, value) VALUES ('failure_count', '0')"
-        )
-        await db.commit()
-        return 0
-    try:
-        return int(row[0] or 0)
-    except ValueError:
-        return 0
-
-
-# 連続失敗回数をDBに保存する
-async def set_failure_count(db: aiosqlite.Connection, count: int) -> None:
-    await db.execute(
-        "INSERT OR REPLACE INTO bot_state (key, value) VALUES ('failure_count', ?)",
-        (str(count),),
-    )
-    await db.commit()
-
 
 # 管理用チャンネルに詳細警告を送る（失敗時はManagerにDMフォールバック）
 async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) -> None:
@@ -1455,41 +1127,6 @@ async def send_dm_replies():
 @send_dm_replies.before_loop
 async def before_send_dm_replies():
     await bot.wait_until_ready()
-
-
-async def load_channel_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str]]:
-    """チャンネルに登録されたアバター名フィルターを返す。"""
-    async with db.execute(
-        "SELECT avatar_name, normalized_name FROM filters WHERE channel_id = ?",
-        (channel_id,),
-    ) as cursor:
-        return await cursor.fetchall()
-
-
-async def load_channel_shop_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str]]:
-    """チャンネルに登録されたショップ名フィルターを返す。"""
-    async with db.execute(
-        "SELECT shop_name, normalized_name FROM shop_filters WHERE channel_id = ?",
-        (channel_id,),
-    ) as cursor:
-        return await cursor.fetchall()
-
-
-async def load_all_channel_filters(
-    db: aiosqlite.Connection,
-) -> tuple[dict[int, list[tuple[str, str]]], dict[int, list[tuple[str, str]]]]:
-    """全チャンネルのフィルターをまとめて読み込む（通知処理の高速化用）。"""
-    avatar_filters: dict[int, list[tuple[str, str]]] = {}
-    async with db.execute("SELECT channel_id, avatar_name, normalized_name FROM filters") as cursor:
-        for row in await cursor.fetchall():
-            avatar_filters.setdefault(row[0], []).append((row[1], row[2]))
-
-    shop_filters: dict[int, list[tuple[str, str]]] = {}
-    async with db.execute("SELECT channel_id, shop_name, normalized_name FROM shop_filters") as cursor:
-        for row in await cursor.fetchall():
-            shop_filters.setdefault(row[0], []).append((row[1], row[2]))
-
-    return avatar_filters, shop_filters
 
 
 async def broadcast_item(
