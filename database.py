@@ -8,6 +8,8 @@ from typing import Any
 import aiohttp
 import aiosqlite
 
+import logging_utils as log
+
 DB_PATH = "bot_data.db"
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
@@ -176,9 +178,9 @@ class TursoClient:
 def db_connect():
     """Turso が設定されていれば Turso、なければローカルの SQLite を使う。"""
     if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
-        print(f"🗄️ データベース: Turso ({TURSO_DATABASE_URL})")
+        log.info("db_connect", f"🗄️ データベース: Turso ({TURSO_DATABASE_URL})")
         return TursoClient(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
-    print(f"🗄️ データベース: ローカルSQLite ({DB_PATH})")
+    log.info("db_connect", f"🗄️ データベース: ローカルSQLite ({DB_PATH})")
     return aiosqlite.connect(DB_PATH)
 
 
@@ -272,10 +274,10 @@ async def validate_db_connection() -> bool:
             await init_db(db)
             async with db.execute("SELECT value FROM bot_state WHERE key = 'failure_count'") as cursor:
                 row = await cursor.fetchone()
-                print(f"✅ DB接続テスト成功 (failure_count={row[0] if row else 'N/A'})")
+                log.info("validate_db_connection", f"✅ DB接続テスト成功 (failure_count={row[0] if row else 'N/A'})")
                 return True
     except Exception as e:
-        print(f"❌ DB接続テスト失敗: {e}")
+        log.error("validate_db_connection", f"❌ DB接続テスト失敗: {e}")
         return False
 
 

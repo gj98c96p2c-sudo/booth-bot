@@ -25,6 +25,7 @@ def normalize_avatar_name(name: str) -> str:
     name = unicodedata.normalize("NFKC", name)
     # カタカナ → ひらがな
     name = name.translate(_KATAKANA_TO_HIRAGANA)
-    # 記号・空白を除去
+    # 記号・空白を除去（アンダースコアも区切り記号として扱う）
     name = re.sub(r"[^\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf\u3400-\u4dbf\w]", "", name)
+    name = name.replace("_", "")
     return name

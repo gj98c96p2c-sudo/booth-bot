@@ -36,6 +36,21 @@ from database import (
     TURSO_DATABASE_URL,
 )
 from utils import normalize_avatar_name
+import logging_utils as log
+from booth import (
+    CATEGORY_LABELS as BOOTH_CATEGORY_LABELS,
+    CHECK_INTERVAL_MINUTES,
+    FAILURE_ALERT_THRESHOLD,
+    LOOKBACK_MINUTES,
+    MAX_RETRIES,
+    RETRY_BASE_DELAY,
+    SEARCH_PAGES,
+    SEARCH_URL_TEMPLATE,
+    get_item_labels,
+    map_category_label,
+    parse_item_json,
+    parse_search_page,
+)
 
 # ───────────────────────────────────────────
 # 定数
@@ -51,22 +66,7 @@ BOT_TEST_CHANNEL_ID = int(BOT_TEST_CHANNEL_ID_RAW) if BOT_TEST_CHANNEL_ID_RAW.st
 MANAGER_USER_ID_RAW = os.getenv("MANAGER_USER_ID", "")
 MANAGER_USER_ID = int(MANAGER_USER_ID_RAW) if MANAGER_USER_ID_RAW.strip().lstrip("-").isdigit() else None
 
-CATEGORY_LABELS = {
-    "衣装": ["3D衣装"],
-    "髪": ["3D髪型", "3D髪"],
-    "小物": ["3D装飾品", "3D小道具"],
-    "ギミック": ["3Dツール・システム", "3Dモーション・アニメーション", "3D小道具"],
-}
-
-# VRChatタグ付き商品の新着検索URL（カテゴリはJSON内の category.name で判定）
-SEARCH_URL_TEMPLATE = "https://booth.pm/ja/search/VRChat?sort=new&page={page}"
-
-SEARCH_PAGES = 2                # 巡回するページ数（1ページ60件）
-CHECK_INTERVAL_MINUTES = 5      # 巡回間隔（分）
-LOOKBACK_MINUTES = 10           # 何分以内に公開された商品を「新作」とみなすか
-MAX_RETRIES = 3                 # HTTPリトライ回数
-RETRY_BASE_DELAY = 2            # リトライの基底秒数
-FAILURE_ALERT_THRESHOLD = 3     # 何回連続で失敗したら警告を出すか
+CATEGORY_LABELS = BOOTH_CATEGORY_LABELS
 
 
 def validate_environment() -> list[str]:
@@ -85,25 +85,6 @@ def validate_environment() -> list[str]:
     return issues
 
 
-# カテゴリ名からユーザー向けラベル（衣装/髪/小物/ギミック）を返す
-def map_category_label(category_name: str) -> str | None:
-    for label, booth_names in CATEGORY_LABELS.items():
-        if category_name in booth_names:
-            return label
-    return None
-
-
-# 商品に対応する通知カテゴリのリストを返す（無料は追加）
-def get_item_labels(item: dict) -> list[str]:
-    labels: list[str] = []
-    base_label = map_category_label(item["category_name"])
-    if base_label:
-        labels.append(base_label)
-    if item["price"] == "¥ 0":
-        labels.append("無料")
-    return labels
-
-
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -120,27 +101,27 @@ class MyBot(commands.Bot):
         async with db_connect() as db:
             await init_db(db)
         await self.tree.sync()
-        print("✅ スラッシュコマンドの同期が完了しました")
+        log.info("setup_hook", "✅ スラッシュコマンドの同期が完了しました")
         check_booth_job.start()
         send_dm_replies.start()
 
 # 管理用チャンネルに詳細警告を送る（失敗時はManagerにDMフォールバック）
 async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) -> None:
     if ADMIN_CHANNEL_ID is None:
-        print(f"⚠️ ADMIN_CHANNEL_ID が未設定なので管理用警告をスキップ: {title}")
+        log.warn("send_admin_alert", f"⚠️ ADMIN_CHANNEL_ID が未設定なので管理用警告をスキップ: {title}")
         return
 
-    print(f"📤 管理用警告送信開始: {title} → ADMIN_CHANNEL_ID={ADMIN_CHANNEL_ID}")
+    log.info("send_admin_alert", f"📤 管理用警告送信開始: {title} → ADMIN_CHANNEL_ID={ADMIN_CHANNEL_ID}")
 
     channel = bot.get_channel(ADMIN_CHANNEL_ID)
     fetch_error = None
     if channel is None:
         try:
             channel = await bot.fetch_channel(ADMIN_CHANNEL_ID)
-            print(f"✅ 管理用チャンネルを fetch_channel で取得: #{getattr(channel, 'name', 'N/A')}")
+            log.info("send_admin_alert", f"✅ 管理用チャンネルを fetch_channel で取得: #{getattr(channel, 'name', 'N/A')}")
         except Exception as e:
             fetch_error = str(e)
-            print(f"❌ 管理用チャンネル取得失敗 (ID: {ADMIN_CHANNEL_ID}): {e}")
+            log.error("send_admin_alert", f"❌ 管理用チャンネル取得失敗 (ID: {ADMIN_CHANNEL_ID}): {e}")
 
     embed = discord.Embed(
         title=title,
@@ -154,11 +135,11 @@ async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) 
     if channel is not None:
         try:
             await channel.send(embed=embed)
-            print(f"🚨 管理用チャンネルに警告を送信: {title}")
+            log.info("send_admin_alert", f"🚨 管理用チャンネルに警告を送信: {title}")
             return
         except Exception as e:
             channel_send_error = str(e)
-            print(f"❌ 管理用チャンネルへの警告送信失敗: {e}")
+            log.error("send_admin_alert", f"❌ 管理用チャンネルへの警告送信失敗: {e}")
     else:
         channel_send_error = fetch_error or "チャンネルがNoneです"
 
@@ -180,9 +161,9 @@ async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) 
                 )
                 fallback_embed.set_footer(text="BOOTH通知Bot 自己申告システム")
                 await manager.send(embed=fallback_embed)
-                print(f"📩 Managerユーザー (ID: {MANAGER_USER_ID}) に警告をDM送信: {title}")
+                log.info("send_admin_alert", f"📩 Managerユーザー (ID: {MANAGER_USER_ID}) に警告をDM送信: {title}")
         except Exception as e:
-            print(f"❌ ManagerユーザーへのDM送信も失敗 (ID: {MANAGER_USER_ID}): {e}")
+            log.error("send_admin_alert", f"❌ ManagerユーザーへのDM送信も失敗 (ID: {MANAGER_USER_ID}): {e}")
 
 
 # 登録済み全チャンネルにユーザー向け告知を送る
@@ -191,7 +172,7 @@ async def send_user_outage_notice(db: aiosqlite.Connection, message_text: str) -
         rows = await cursor.fetchall()
 
     if not rows:
-        print("ℹ️ 通知設定されているチャンネルがないのでユーザー告知をスキップ")
+        log.info("send_user_outage_notice", "ℹ️ 通知設定されているチャンネルがないのでユーザー告知をスキップ")
         return
 
     for (channel_id,) in rows:
@@ -200,12 +181,12 @@ async def send_user_outage_notice(db: aiosqlite.Connection, message_text: str) -
             try:
                 channel = await bot.fetch_channel(channel_id)
             except discord.NotFound:
-                print(f"🗑️ 存在しないチャンネル (ID: {channel_id}) をDBから削除")
+                log.info("send_user_outage_notice", f"🗑️ 存在しないチャンネル (ID: {channel_id}) をDBから削除")
                 await db.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
                 await db.commit()
                 continue
             except Exception as e:
-                print(f"❌ チャンネル取得失敗 (ID: {channel_id}): {e}")
+                log.error("send_user_outage_notice", f"❌ チャンネル取得失敗 (ID: {channel_id}): {e}")
                 continue
 
         if channel is None:
@@ -213,11 +194,11 @@ async def send_user_outage_notice(db: aiosqlite.Connection, message_text: str) -
 
         try:
             await channel.send(message_text)
-            print(f"📢 ユーザー告知送信: #{channel.name}")
+            log.info("send_user_outage_notice", f"📢 ユーザー告知送信: #{channel.name}")
         except discord.Forbidden:
-            print(f"❌ ユーザー告知送信権限なし: #{channel.name} (ID: {channel_id})")
+            log.error("send_user_outage_notice", f"❌ ユーザー告知送信権限なし: #{channel.name} (ID: {channel_id})")
         except Exception as e:
-            print(f"❌ ユーザー告知送信失敗: #{channel.name}: {e}")
+            log.error("send_user_outage_notice", f"❌ ユーザー告知送信失敗: #{channel.name}: {e}")
 
 
 bot = MyBot()
@@ -234,7 +215,7 @@ async def on_error(event: str, *args, **kwargs):
     error_summary = error_text[-1].strip() if error_text else "不明なエラー"
     full_traceback = "".join(error_text)
 
-    print(f"❌ [on_error] イベント '{event}' で未捕捉例外:")
+    log.error("on_error", f"❌ [on_error] イベント '{event}' で未捕捉例外:")
     print(full_traceback)
 
     await send_admin_alert(
@@ -272,11 +253,11 @@ async def on_message(message: discord.Message):
 
     # Manager側のターミナル/ログに出力（目立つように区切り付き）
     print("\n" + "=" * 60)
-    print(f"📩 DM受信 from {user.display_name} ({user.name} / ID: {user.id})")
-    print(f"📝 {content}")
+    log.info("on_message", f"📩 DM受信 from {user.display_name} ({user.name} / ID: {user.id})")
+    log.info("on_message", f"📝 {content}")
     if attachment_urls:
-        print(f"📎 添付: {', '.join(attachment_urls)}")
-    print(f"💡 返信する: /reply user:{user.id} message:ここに返信内容")
+        log.info("on_message", f"📎 添付: {', '.join(attachment_urls)}")
+    log.info("on_message", f"💡 返信する: /reply user:{user.id} message:ここに返信内容")
     print("=" * 60 + "\n")
 
     # DBに保存（外からも確認できるように）
@@ -295,7 +276,7 @@ async def on_message(message: discord.Message):
             ))
             await db.commit()
     except Exception as e:
-        print(f"⚠️ DM保存失敗: {e}")
+        log.warn("on_message", f"⚠️ DM保存失敗: {e}")
 
     # ユーザーに転送完了を返信
     try:
@@ -304,7 +285,7 @@ async def on_message(message: discord.Message):
             "　追って返信が届くので少々お待ちください。"
         )
     except Exception as e:
-        print(f"⚠️ DM転送確認メッセージ送信失敗: {e}")
+        log.warn("on_message", f"⚠️ DM転送確認メッセージ送信失敗: {e}")
 
 
 @bot.tree.command(name="reply", description="DMブリッジ：指定ユーザーにBotから返信を送信する（Manager用）")
@@ -346,7 +327,7 @@ async def reply_command(interaction: discord.Interaction, user_id: str, message:
             f"✅ {target_user.display_name} ({target_user.id}) に返信を送信しました。\n\n{message}",
             ephemeral=True,
         )
-        print(f"📤 Managerから返信送信 to {target_user.display_name} ({target_user.id}): {message}")
+        log.info("reply_command", f"📤 Managerから返信送信 to {target_user.display_name} ({target_user.id}): {message}")
     except discord.Forbidden:
         await interaction.followup.send(
             "❌ そのユーザーにはDMを送信できません。DMを受け取れない設定か、ブロックされています。",
@@ -373,7 +354,7 @@ async def start_web_server():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"🌐 Webサーバーがポート {port} で起動しました")
+    log.info("start_web_server", f"🌐 Webサーバーがポート {port} で起動しました")
 
 
 # ───────────────────────────────────────────
@@ -457,7 +438,7 @@ async def on_guild_join(guild: discord.Guild):
     try:
         await target_channel.send(embed=embed)
     except Exception as e:
-        print(f"入室メッセージ送信エラー: {e}")
+        log.info("on_guild_join", f"入室メッセージ送信エラー: {e}")
 
 
 # ───────────────────────────────────────────
@@ -581,7 +562,7 @@ class FilterNameModal(discord.ui.Modal):
                         ephemeral=True,
                     )
                 except Exception as e:
-                    print(f"フィルター追加エラー: {e}")
+                    log.info("on_submit", f"フィルター追加エラー: {e}")
                     await interaction.response.send_message(
                         f"⚠️ {target_label}「`{name_value}`」は既に登録されているか、登録できないよ。",
                         ephemeral=True,
@@ -802,53 +783,28 @@ async def fetch_with_retry(session: aiohttp.ClientSession, url: str) -> str | No
                     retry_after = float(
                         response.headers.get("Retry-After", RETRY_BASE_DELAY * attempt)
                     )
-                    print(
+                    log.warn(
+                        "fetch_with_retry",
                         f"⚠️ [fetch] レートリミット (429) を受信: {url} "
-                        f"→ {retry_after:.0f}秒後にリトライ ({attempt}/{MAX_RETRIES})"
+                        f"→ {retry_after:.0f}秒後にリトライ ({attempt}/{MAX_RETRIES})",
                     )
                     await asyncio.sleep(retry_after)
                     continue
 
-                print(
+                log.warn(
+                    "fetch_with_retry",
                     f"⚠️ [fetch] HTTP {response.status}: {url} "
-                    f"(試行 {attempt}/{MAX_RETRIES})"
+                    f"(試行 {attempt}/{MAX_RETRIES})",
                 )
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(f"⚠️ [fetch] 通信エラー: {url} | {e} (試行 {attempt}/{MAX_RETRIES})")
+            log.warn("fetch_with_retry", f"⚠️ [fetch] 通信エラー: {url} | {e} (試行 {attempt}/{MAX_RETRIES})")
 
         if attempt < MAX_RETRIES:
             delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
             await asyncio.sleep(delay)
 
-    print(f"❌ [fetch] 最大リトライ回数に到達: {url}")
+    log.error("fetch_with_retry", f"❌ [fetch] 最大リトライ回数に到達: {url}")
     return None
-
-
-def parse_search_page(html: str) -> list[str]:
-    """検索結果ページから商品IDのリストを抽出する。"""
-    soup = bs4.BeautifulSoup(html, "html.parser")
-    cards = soup.select("li.item-card") or soup.select(".item-card")
-
-    if not cards:
-        print("⚠️ [parse_search_page] アイテム要素が見つかりません — BOOTHのHTML構造が変わった可能性があります")
-        return []
-
-    item_ids: list[str] = []
-    seen = set()
-    for card in cards:
-        link = card.select_one("a[href*='/items/']")
-        if not link:
-            continue
-        href = link.get("href", "")
-        match = re.search(r"/items/(\d+)", href)
-        if not match:
-            continue
-        item_id = match.group(1)
-        if item_id not in seen:
-            seen.add(item_id)
-            item_ids.append(item_id)
-
-    return item_ids
 
 
 async def fetch_item_json(session: aiohttp.ClientSession, item_id: str) -> dict | None:
@@ -860,52 +816,8 @@ async def fetch_item_json(session: aiohttp.ClientSession, item_id: str) -> dict 
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        print(f"⚠️ [fetch_item_json] JSONデコード失敗 (ID: {item_id}): {e}")
+        log.warn("fetch_item_json", f"⚠️ [fetch_item_json] JSONデコード失敗 (ID: {item_id}): {e}")
         return None
-
-
-def parse_item_json(item_id: str, data: dict, category_label: str) -> dict | None:
-    """商品JSONをBot内部形式に変換する。"""
-    title = data.get("name", "").strip()
-    published_at = data.get("published_at", "").strip()
-
-    if not title:
-        print(f"⚠️ [parse_item_json] タイトルが無い商品をスキップ: ID={item_id}")
-        return None
-    if not published_at:
-        print(f"⚠️ [parse_item_json] 公開日時が無い商品をスキップ: ID={item_id}")
-        return None
-
-    # 画像URL: 最初の画像の original を使用
-    images = data.get("images", [])
-    image_url = ""
-    if images and isinstance(images, list):
-        image_url = images[0].get("original", "") or ""
-
-    # タグ
-    tags = [tag.get("name", "") for tag in data.get("tags", []) if tag.get("name")]
-
-    # BOOTH上のカテゴリ名
-    category_name = ""
-    category_data = data.get("category")
-    if isinstance(category_data, dict):
-        category_name = category_data.get("name", "") or ""
-
-    return {
-        "item_id": item_id,
-        "title": title,
-        "url": f"https://booth.pm/ja/items/{item_id}",
-        "price": data.get("price", "不明"),
-        "category": category_label,  # ユーザー向けラベル（例: "衣装"）
-        "category_name": category_name,  # BOOTH上の生の名前（例: "3D衣装"）
-        "likes": int(data.get("wish_lists_count", 0) or 0),
-        "image_url": image_url,
-        "is_adult": 1 if data.get("is_adult") else 0,
-        "published_at": published_at,
-        "shop_name": data.get("shop", {}).get("name", "") if isinstance(data.get("shop"), dict) else "",
-        "shop_url": data.get("shop", {}).get("url", "") if isinstance(data.get("shop"), dict) else "",
-        "tags": json.dumps(tags, ensure_ascii=False),
-    }
 
 
 # ───────────────────────────────────────────
@@ -917,7 +829,7 @@ async def run_check_booth_job():
     成功したら True、失敗したら False を返す。
     """
     now = datetime.datetime.now(datetime.timezone.utc)
-    print(f"\n🔍 --- 【巡回スタート】{now:%Y-%m-%d %H:%M:%S} ---")
+    log.info("run_check_booth_job", f"\n🔍 --- 【巡回スタート】{now:%Y-%m-%d %H:%M:%S} ---")
 
     headers = {
         "User-Agent": (
@@ -936,17 +848,17 @@ async def run_check_booth_job():
             if html is None:
                 continue
             ids = parse_search_page(html)
-            print(f"📄 検索ページ {page}: {len(ids)} 件の商品IDを取得")
+            log.info("run_check_booth_job", f"📄 検索ページ {page}: {len(ids)} 件の商品IDを取得")
             for item_id in ids:
                 if item_id not in all_item_ids:
                     all_item_ids.append(item_id)
             await asyncio.sleep(0.5)
 
-        print(f"📦 重複除去後: {len(all_item_ids)} 件")
+        log.info("run_check_booth_job", f"📦 重複除去後: {len(all_item_ids)} 件")
 
         # 検索結果がゼロなら失敗とみなす（BOOTH構造変更の可能性）
         if not all_item_ids:
-            print("❌ 検索結果から商品IDが1件も取得できませんでした")
+            log.error("run_check_booth_job", "❌ 検索結果から商品IDが1件も取得できませんでした")
             return False
 
         # 2. 各商品のJSONを取得して処理
@@ -1020,7 +932,7 @@ async def run_check_booth_job():
                 await asyncio.sleep(0.2)
 
             await db.commit()
-            print(f"🆕 新作判定: {len(new_items)} 件")
+            log.info("run_check_booth_job", f"🆕 新作判定: {len(new_items)} 件")
 
             # 3. 通知処理（フィルターは1回だけ読み込む）
             all_avatar_filters, all_shop_filters = await load_all_channel_filters(db)
@@ -1033,9 +945,9 @@ async def run_check_booth_job():
                     )
                     await db.commit()
                 except Exception as e:
-                    print(f"❌ [check_booth_job] 通知エラー (ID: {item['item_id']}): {e}")
+                    log.error("run_check_booth_job", f"❌ [check_booth_job] 通知エラー (ID: {item['item_id']}): {e}")
 
-    print(f"🔍 --- 【巡回完了】{len(new_items)} 件通知 ---\n")
+    log.info("run_check_booth_job", f"🔍 --- 【巡回完了】{len(new_items)} 件通知 ---\n")
     return True
 
 
@@ -1051,20 +963,20 @@ async def check_booth_job():
         try:
             success = await run_check_booth_job()
         except Exception as e:
-            print(f"❌ [check_booth_job] 巡回中に例外が発生: {e}")
+            log.error("check_booth_job", f"❌ [check_booth_job] 巡回中に例外が発生: {e}")
             success = False
 
         if success:
             # 成功したら失敗カウントをリセット
             if failure_count != 0:
                 await set_failure_count(db, 0)
-                print("✅ 巡回に成功したので失敗カウントをリセット")
+                log.info("check_booth_job", "✅ 巡回に成功したので失敗カウントをリセット")
             return
 
         # 失敗したらカウントを増やす
         failure_count += 1
         await set_failure_count(db, failure_count)
-        print(f"⚠️ 巡回失敗。連続失敗回数: {failure_count}/{FAILURE_ALERT_THRESHOLD}")
+        log.warn("check_booth_job", f"⚠️ 巡回失敗。連続失敗回数: {failure_count}/{FAILURE_ALERT_THRESHOLD}")
 
         # 連続失敗が閾値を超えたら警告を出す（閾値以降は毎回通知）
         if failure_count >= FAILURE_ALERT_THRESHOLD:
@@ -1103,10 +1015,10 @@ async def send_dm_replies():
                 try:
                     user = await bot.fetch_user(user_id)
                     if user is None:
-                        print(f"⚠️ [dm_outbox] ユーザー取得失敗 (ID: {user_id})")
+                        log.warn("send_dm_replies", f"⚠️ [dm_outbox] ユーザー取得失敗 (ID: {user_id})")
                         continue
                     await user.send(content)
-                    print(f"📤 [DMブリッジ] {user.display_name} ({user_id}) に返信送信")
+                    log.info("send_dm_replies", f"📤 [DMブリッジ] {user.display_name} ({user_id}) に返信送信")
                     sent_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
                     await db.execute(
                         "UPDATE dm_outbox SET sent_at = ? WHERE id = ?",
@@ -1115,13 +1027,13 @@ async def send_dm_replies():
                     await db.commit()
                     await asyncio.sleep(0.5)
                 except discord.Forbidden:
-                    print(f"❌ [DMブリッジ] {user_id} への送信権限なし。10分後に再試行。")
+                    log.error("send_dm_replies", f"❌ [DMブリッジ] {user_id} への送信権限なし。10分後に再試行。")
                 except discord.HTTPException as e:
-                    print(f"❌ [DMブリッジ] HTTPエラー: {e}")
+                    log.error("send_dm_replies", f"❌ [DMブリッジ] HTTPエラー: {e}")
                 except Exception as e:
-                    print(f"❌ [DMブリッジ] 送信失敗: {e}")
+                    log.error("send_dm_replies", f"❌ [DMブリッジ] 送信失敗: {e}")
     except Exception as e:
-        print(f"❌ [DMブリッジ] ポーリングエラー: {e}")
+        log.error("send_dm_replies", f"❌ [DMブリッジ] ポーリングエラー: {e}")
 
 
 @send_dm_replies.before_loop
@@ -1197,15 +1109,15 @@ async def broadcast_item(
             try:
                 channel = await bot.fetch_channel(channel_id)
             except discord.NotFound:
-                print(f"🗑️ 存在しないチャンネル (ID: {channel_id}) をDBから削除しました")
+                log.info("broadcast_item", f"🗑️ 存在しないチャンネル (ID: {channel_id}) をDBから削除しました")
                 await db.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
                 await db.commit()
                 continue
             except discord.Forbidden:
-                print(f"⚠️ チャンネル (ID: {channel_id}) へのアクセス権限がありません")
+                log.warn("broadcast_item", f"⚠️ チャンネル (ID: {channel_id}) へのアクセス権限がありません")
                 continue
             except Exception as e:
-                print(f"❌ チャンネル取得失敗 (ID: {channel_id}): {e}")
+                log.error("broadcast_item", f"❌ チャンネル取得失敗 (ID: {channel_id}): {e}")
                 continue
 
         if not channel:
@@ -1274,14 +1186,14 @@ async def broadcast_item(
 
         try:
             await channel.send(embed=embed, view=view)
-            print(f"🚀 【送信成功】#{channel.name} に 「{item['title'][:20]}...」 を通知")
+            log.info("broadcast_item", f"🚀 【送信成功】#{channel.name} に 「{item['title'][:20]}...」 を通知")
             await asyncio.sleep(0.3)
         except discord.Forbidden:
-            print(f"❌ 【送信失敗】#{channel.name} への送信権限がありません（次回巡回で再試行します）")
+            log.error("broadcast_item", f"❌ 【送信失敗】#{channel.name} への送信権限がありません（次回巡回で再試行します）")
         except discord.HTTPException as e:
-            print(f"❌ 【送信HTTPエラー】#{channel.name}: {e}（次回巡回で再試行します）")
+            log.error("broadcast_item", f"❌ 【送信HTTPエラー】#{channel.name}: {e}（次回巡回で再試行します）")
         except Exception as e:
-            print(f"❌ 【送信エラー】#{channel.name}: {e}（次回巡回で再試行します）")
+            log.error("broadcast_item", f"❌ 【送信エラー】#{channel.name}: {e}（次回巡回で再試行します）")
 
 
 # ───────────────────────────────────────────
@@ -1289,14 +1201,14 @@ async def broadcast_item(
 # ───────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"🎉 {bot.user.name} が正常に起動しました")
+    log.info("on_ready", f"🎉 {bot.user.name} が正常に起動しました")
 
     # 環境変数バリデーション
     env_issues = validate_environment()
     if env_issues:
-        print("⚠️ 環境変数の問題:")
+        log.warn("on_ready", "⚠️ 環境変数の問題:")
         for issue in env_issues:
-            print(f"   - {issue}")
+            log.info("on_ready", f"   - {issue}")
         if MANAGER_USER_ID and DISCORD_TOKEN:
             await send_admin_alert(
                 title="⚠️ 環境変数の問題があります",
@@ -1304,12 +1216,12 @@ async def on_ready():
                 color=0xFFA500,
             )
     else:
-        print("✅ 環境変数チェックOK")
+        log.info("on_ready", "✅ 環境変数チェックOK")
 
     if ADMIN_CHANNEL_ID:
-        print(f"🔔 管理用警告チャンネル: {ADMIN_CHANNEL_ID}")
+        log.info("on_ready", f"🔔 管理用警告チャンネル: {ADMIN_CHANNEL_ID}")
     if MANAGER_USER_ID:
-        print(f"👤 Managerユーザー: {MANAGER_USER_ID}")
+        log.info("on_ready", f"👤 Managerユーザー: {MANAGER_USER_ID}")
 
     # DB接続確認
     db_ok = await validate_db_connection()
@@ -1319,13 +1231,13 @@ async def on_ready():
             description="起動時のDB接続テストに失敗しました。Renderの環境変数を確認してください。",
         )
     elif not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
-        print("⚠️ Turso未設定: ローカルSQLiteを使用中。Renderの無料枠ではデータが揮発する可能性があります。")
+        log.warn("on_ready", "⚠️ Turso未設定: ローカルSQLiteを使用中。Renderの無料枠ではデータが揮発する可能性があります。")
 
 
 async def main():
     await start_web_server()
     if not DISCORD_TOKEN:
-        print("⚠️ エラー: DISCORD_BOT_TOKEN が設定されていません")
+        log.warn("main", "⚠️ エラー: DISCORD_BOT_TOKEN が設定されていません")
         return
     await bot.start(DISCORD_TOKEN)
 
