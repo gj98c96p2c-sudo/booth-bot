@@ -9,16 +9,13 @@ import asyncio
 import datetime
 import json
 import os
-import re
 import sys
 import traceback
-import unicodedata
 from typing import Literal
 
 import aiohttp
 from aiohttp import web
 import aiosqlite
-import bs4
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks

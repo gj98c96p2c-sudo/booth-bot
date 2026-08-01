@@ -3,8 +3,6 @@
 import asyncio
 import datetime
 import os
-from typing import Any
-
 import aiohttp
 import aiosqlite
 
