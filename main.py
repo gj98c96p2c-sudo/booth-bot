@@ -418,22 +418,23 @@ async def set_failure_count(db: aiosqlite.Connection, count: int) -> None:
     await db.commit()
 
 
-# 管理用チャンネルに詳細警告を送る
+# 管理用チャンネルに詳細警告を送る（失敗時はManagerにDMフォールバック）
 async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) -> None:
     if ADMIN_CHANNEL_ID is None:
         print(f"⚠️ ADMIN_CHANNEL_ID が未設定なので管理用警告をスキップ: {title}")
         return
 
+    print(f"📤 管理用警告送信開始: {title} → ADMIN_CHANNEL_ID={ADMIN_CHANNEL_ID}")
+
     channel = bot.get_channel(ADMIN_CHANNEL_ID)
+    fetch_error = None
     if channel is None:
         try:
             channel = await bot.fetch_channel(ADMIN_CHANNEL_ID)
+            print(f"✅ 管理用チャンネルを fetch_channel で取得: #{getattr(channel, 'name', 'N/A')}")
         except Exception as e:
+            fetch_error = str(e)
             print(f"❌ 管理用チャンネル取得失敗 (ID: {ADMIN_CHANNEL_ID}): {e}")
-            return
-
-    if channel is None:
-        return
 
     embed = discord.Embed(
         title=title,
@@ -443,11 +444,39 @@ async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) 
     )
     embed.set_footer(text="BOOTH通知Bot 自己申告システム")
 
-    try:
-        await channel.send(embed=embed)
-        print(f"🚨 管理用チャンネルに警告を送信: {title}")
-    except Exception as e:
-        print(f"❌ 管理用チャンネルへの警告送信失敗: {e}")
+    channel_send_error = None
+    if channel is not None:
+        try:
+            await channel.send(embed=embed)
+            print(f"🚨 管理用チャンネルに警告を送信: {title}")
+            return
+        except Exception as e:
+            channel_send_error = str(e)
+            print(f"❌ 管理用チャンネルへの警告送信失敗: {e}")
+    else:
+        channel_send_error = fetch_error or "チャンネルがNoneです"
+
+    # チャンネル送信に失敗したらManagerにDMフォールバック
+    if MANAGER_USER_ID is not None:
+        try:
+            manager = await bot.fetch_user(MANAGER_USER_ID)
+            if manager is not None:
+                fallback_desc = (
+                    f"{description}\n\n"
+                    f"⚠️ 元の管理用チャンネル (ID: {ADMIN_CHANNEL_ID}) への送信に失敗しました:\n"
+                    f"`{channel_send_error}`"
+                )
+                fallback_embed = discord.Embed(
+                    title=f"【フォールバック】{title}",
+                    description=fallback_desc,
+                    color=color,
+                    timestamp=datetime.datetime.now(datetime.timezone.utc),
+                )
+                fallback_embed.set_footer(text="BOOTH通知Bot 自己申告システム")
+                await manager.send(embed=fallback_embed)
+                print(f"📩 Managerユーザー (ID: {MANAGER_USER_ID}) に警告をDM送信: {title}")
+        except Exception as e:
+            print(f"❌ ManagerユーザーへのDM送信も失敗 (ID: {MANAGER_USER_ID}): {e}")
 
 
 # 登録済み全チャンネルにユーザー向け告知を送る
@@ -1306,8 +1335,8 @@ async def check_booth_job():
         await set_failure_count(db, failure_count)
         print(f"⚠️ 巡回失敗。連続失敗回数: {failure_count}/{FAILURE_ALERT_THRESHOLD}")
 
-        # 3回連続失敗したら警告を出す（3回目だけ）
-        if failure_count == FAILURE_ALERT_THRESHOLD:
+        # 連続失敗が閾値を超えたら警告を出す（閾値以降は毎回通知）
+        if failure_count >= FAILURE_ALERT_THRESHOLD:
             await send_admin_alert(
                 title="🚨 BOOTH巡回が3回連続で失敗しました",
                 description=(
@@ -1565,6 +1594,14 @@ async def broadcast_item(
 @bot.event
 async def on_ready():
     print(f"🎉 {bot.user.name} が正常に起動しました")
+    if ADMIN_CHANNEL_ID:
+        print(f"🔔 管理用警告チャンネル: {ADMIN_CHANNEL_ID}")
+    else:
+        print("⚠️ ADMIN_CHANNEL_ID が未設定")
+    if MANAGER_USER_ID:
+        print(f"👤 Managerユーザー: {MANAGER_USER_ID}")
+    else:
+        print("⚠️ MANAGER_USER_ID が未設定")
 
 
 async def main():
