@@ -10,6 +10,8 @@ import datetime
 import json
 import os
 import re
+import sys
+import traceback
 import unicodedata
 from typing import Literal
 
@@ -54,6 +56,22 @@ FAILURE_ALERT_THRESHOLD = 3     # 何回連続で失敗したら警告を出す�
 
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+
+
+def validate_environment() -> list[str]:
+    """必須・推奨環境変数をチェックし、問題のリストを返す。"""
+    issues: list[str] = []
+    if not DISCORD_TOKEN:
+        issues.append("DISCORD_BOT_TOKEN が未設定")
+    if ADMIN_CHANNEL_ID is None:
+        issues.append("ADMIN_CHANNEL_ID が未設定または無効")
+    if MANAGER_USER_ID is None:
+        issues.append("MANAGER_USER_ID が未設定または無効")
+    if not TURSO_DATABASE_URL:
+        issues.append("TURSO_DATABASE_URL が未設定（Renderではデータが揮発する可能性があります）")
+    if not TURSO_AUTH_TOKEN:
+        issues.append("TURSO_AUTH_TOKEN が未設定（Renderではデータが揮発する可能性があります）")
+    return issues
 
 
 def _turso_pipeline_url(database_url: str) -> str:
@@ -230,8 +248,24 @@ class TursoClient:
 def db_connect():
     """Turso が設定されていれば Turso、なければローカルの SQLite を使う。"""
     if TURSO_DATABASE_URL and TURSO_AUTH_TOKEN:
+        print(f"🗄️ データベース: Turso ({TURSO_DATABASE_URL})")
         return TursoClient(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
+    print(f"🗄️ データベース: ローカルSQLite ({DB_PATH})")
     return aiosqlite.connect(DB_PATH)
+
+
+async def validate_db_connection() -> bool:
+    """DB接続を確認し、永続化できているか検証する。"""
+    try:
+        async with db_connect() as db:
+            await init_db(db)
+            async with db.execute("SELECT value FROM bot_state WHERE key = 'failure_count'") as cursor:
+                row = await cursor.fetchone()
+                print(f"✅ DB接続テスト成功 (failure_count={row[0] if row else 'N/A'})")
+                return True
+    except Exception as e:
+        print(f"❌ DB接続テスト失敗: {e}")
+        return False
 
 
 # カテゴリ名からユーザー向けラベル（衣装/髪/小物/ギミック）を返す
@@ -515,6 +549,31 @@ async def send_user_outage_notice(db: aiosqlite.Connection, message_text: str) -
 
 
 bot = MyBot()
+
+
+# ───────────────────────────────────────────
+# グローバルエラーハンドラ
+# ───────────────────────────────────────────
+@bot.event
+async def on_error(event: str, *args, **kwargs):
+    """未捕捉のイベントエラーをManagerに通知する。"""
+    exc_info = sys.exc_info()
+    error_text = traceback.format_exception(*exc_info) if exc_info[0] else ["不明なエラー"]
+    error_summary = error_text[-1].strip() if error_text else "不明なエラー"
+    full_traceback = "".join(error_text)
+
+    print(f"❌ [on_error] イベント '{event}' で未捕捉例外:")
+    print(full_traceback)
+
+    await send_admin_alert(
+        title=f"🚨 未捕捉例外: {event}",
+        description=(
+            f"イベント `{event}` で例外が発生しました。\n\n"
+            f"```\n{error_summary[:500]}\n```\n\n"
+            f"詳細はRenderのログを確認してください。"
+        ),
+        color=0xFF0000,
+    )
 
 
 # ───────────────────────────────────────────
@@ -1594,14 +1653,36 @@ async def broadcast_item(
 @bot.event
 async def on_ready():
     print(f"🎉 {bot.user.name} が正常に起動しました")
+
+    # 環境変数バリデーション
+    env_issues = validate_environment()
+    if env_issues:
+        print("⚠️ 環境変数の問題:")
+        for issue in env_issues:
+            print(f"   - {issue}")
+        if MANAGER_USER_ID and DISCORD_TOKEN:
+            await send_admin_alert(
+                title="⚠️ 環境変数の問題があります",
+                description="\n".join(f"- {issue}" for issue in env_issues),
+                color=0xFFA500,
+            )
+    else:
+        print("✅ 環境変数チェックOK")
+
     if ADMIN_CHANNEL_ID:
         print(f"🔔 管理用警告チャンネル: {ADMIN_CHANNEL_ID}")
-    else:
-        print("⚠️ ADMIN_CHANNEL_ID が未設定")
     if MANAGER_USER_ID:
         print(f"👤 Managerユーザー: {MANAGER_USER_ID}")
-    else:
-        print("⚠️ MANAGER_USER_ID が未設定")
+
+    # DB接続確認
+    db_ok = await validate_db_connection()
+    if not db_ok:
+        await send_admin_alert(
+            title="🚨 DB接続に失敗しました",
+            description="起動時のDB接続テストに失敗しました。Renderの環境変数を確認してください。",
+        )
+    elif not TURSO_DATABASE_URL or not TURSO_AUTH_TOKEN:
+        print("⚠️ Turso未設定: ローカルSQLiteを使用中。Renderの無料枠ではデータが揮発する可能性があります。")
 
 
 async def main():
