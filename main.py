@@ -1025,6 +1025,30 @@ async def status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="test-alert", description="管理用チャンネルにテスト警告を送信します（Manager用）")
+async def test_alert(interaction: discord.Interaction):
+    """ADMIN_CHANNEL_ID にテスト警告を送信する。"""
+    if MANAGER_USER_ID is None or interaction.user.id != MANAGER_USER_ID:
+        await interaction.response.send_message(
+            "❌ このコマンドは BoothBOT Manager のみ使用できます。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await send_admin_alert(
+        title="🧪 テストアラート",
+        description=(
+            "これは管理用チャンネルのテスト通知です。\n"
+            f"実行者: {interaction.user.display_name} ({interaction.user.name})\n"
+            "このチャンネルに今後、BOOTH巡回の異常通知が届きます。"
+        ),
+        color=0x00BFFF,
+    )
+    await interaction.followup.send(
+        "✅ 管理用チャンネルにテスト警告を送信しました。", ephemeral=True
+    )
+
+
 # ───────────────────────────────────────────
 # BOOTH 取得層（Step 3 で実装）
 # ───────────────────────────────────────────
