@@ -373,67 +373,54 @@ async def on_guild_join(guild: discord.Guild):
 
     embed = discord.Embed(
         title="🎉 BOOTH通知Bot が導入されました！",
-        description="導入ありがとうございます！BOOTHのVRChat向け新作アイテムを自動でお知らせします！",
+        description=(
+            "導入ありがとうございます！\n"
+            "BOOTHのVRChat向け新作アイテムを自動でお知らせするBotです。\n\n"
+            "**まずは下の3ステップだけやればOK！**"
+        ),
         color=0xFF6473,
     )
     embed.add_field(
-        name="📌 基本コマンド（使い方）",
+        name="1️⃣ 通知チャンネルを決める（必須）",
         value=(
-            "`/set-channel` ➔ 通知チャンネルとジャンルを設定\n"
-            "`/remove-channel` ➔ 通知設定を解除\n"
-            "`/filter add` ➔ 通知したいアバター名を追加\n"
-            "`/filter remove` ➔ フィルターを削除\n"
-            "`/filter list` ➔ 登録済みフィルター一覧\n"
-            "`/set-nsfw allow/deny` ➔ R-18の表示/非表示を切り替え\n"
-            "`/status` ➔ 現在の設定を確認"
+            "通知を受け取りたいチャンネルで `/set-channel` を実行してね。\n"
+            "ジャンル（衣装 / 髪 / 小物 / ギミック / 無料）を選べるよ。\n"
+            "**ここまでやれば通知が届き始めるよ。**"
         ),
         inline=False,
     )
     embed.add_field(
-        name="🎯 それぞれのコマンドでできること",
+        name="2️⃣ 通知を絞り込む（任意）",
         value=(
-            "**`/set-channel`**\n"
-            "➔ 今のチャンネルをBOOTH通知専用にする。\n"
-            "　例：衣装と無料だけ通知したい → 衣装・無料にチェック\n\n"
-            "**`/filter add アバター名`**\n"
-            "➔ 特定のアバター名が入った商品だけ通知してほしいときに使う。\n"
-            "　例：`/filter add セレスティア` → タグやタイトルに『セレスティア』と入った商品だけ通知\n\n"
-            "**`/filter remove アバター名`**\n"
-            "➔ 登録したアバター名フィルターを削除する。\n"
-            "　例：`/filter remove セレスティア`\n\n"
-            "**`/filter list`**\n"
-            "➔ 今のチャンネルに登録されているフィルター一覧を見る。\n\n"
-            "**`/set-nsfw allow`**\n"
-            "➔ R-18商品も通知する。デフォルトでは非表示。\n\n"
-            "**`/set-nsfw deny`**\n"
-            "➔ R-18商品を非表示にする（初期状態）。\n\n"
-            "**`/remove-channel`**\n"
-            "➔ このチャンネルへのBOOTH通知を完全に止める。\n\n"
-            "**`/status`**\n"
-            "➔ 今のチャンネルで何が設定されてるか確認できる。"
+            "特定のアバター向けだけ受け取りたいときは `/filter add` を使ってね。\n"
+            "例: `/filter add セレスティア`\n"
+            "**登録しなければ、選んだジャンルの新作は全部通知されるよ。**"
         ),
         inline=False,
     )
     embed.add_field(
-        name="⚙️ 初期設定の手順",
+        name="3️⃣ R-18の表示を決める（任意）",
         value=(
-            "1. `/set-channel` で通知チャンネルとジャンルを設定\n"
-            "2. （任意）`/filter add` で通知したいアバター名を登録\n"
-            "3. （任意）`/set-nsfw` でR-18の表示/非表示を切り替え"
+            "初期状態ではR-18商品は**非表示**だよ。\n"
+            "表示したいときは `/set-nsfw allow` を実行してね。"
         ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📖 もっと詳しく",
+        value="`/help` でいつでも使い方を確認できるよ。`/status` で今の設定が見れるよ。",
         inline=False,
     )
     embed.add_field(
         name="📝 このBotの動き",
         value=(
             "• 5分に1回BOOTHを自動でチェックするよ\n"
-            "• 新商品は公開から10分以内のものだけ通知するよ\n"
-            "• 何かおかしなときは自動でお知らせするよ\n"
-            "• フィルターを設定すると、該当する商品だけが通知されるよ"
+            "• 公開から10分以内の新作だけ通知するよ\n"
+            "• 障害が起きたときは自動でお知らせするよ"
         ),
         inline=False,
     )
-    embed.set_footer(text="BOOTH新作監視Bot • 快適なVRChatライフを！")
+    embed.set_footer(text="BOOTH通知Bot（非公式） / BOOTHの公式Botではありません")
 
     try:
         await target_channel.send(embed=embed)
@@ -744,6 +731,7 @@ async def status(interaction: discord.Interaction):
             row = await cursor.fetchone()
 
         filters = await load_channel_filters(db, channel_id)
+        shop_filters = await load_channel_shop_filters(db, channel_id)
 
     if row is None:
         categories_text = "未設定"
@@ -753,6 +741,9 @@ async def status(interaction: discord.Interaction):
         nsfw_text = "表示" if row[1] else "非表示"
 
     filters_text = ", ".join([f"`{f[0]}`" for f in filters]) if filters else "未登録"
+    shop_filters_text = (
+        ", ".join([f"`{f[0]}`" for f in shop_filters]) if shop_filters else "未登録"
+    )
 
     embed = discord.Embed(
         title="📊 このチャンネルの設定",
@@ -761,13 +752,131 @@ async def status(interaction: discord.Interaction):
     embed.add_field(name="通知カテゴリ", value=categories_text, inline=False)
     embed.add_field(name="R-18設定", value=nsfw_text, inline=False)
     embed.add_field(name="アバター名フィルター", value=filters_text, inline=False)
-    embed.set_footer(text="BOOTH新作監視Bot")
+    embed.add_field(name="ショップ名フィルター", value=shop_filters_text, inline=False)
+    if filters or shop_filters:
+        embed.add_field(
+            name="ℹ️ フィルターの動作",
+            value="登録したキーワードに一致する商品**だけ**通知されるよ。",
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="ℹ️ フィルターの動作",
+            value="フィルター未登録なので、選んだジャンルの新作は**全部**通知されるよ。",
+            inline=False,
+        )
+    embed.set_footer(text="BOOTH通知Bot / 詳しくは /help")
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+INVITE_URL = (
+    "https://discord.com/oauth2/authorize"
+    "?client_id=1531860064061882368&permissions=2147503104"
+    "&scope=bot%20applications.commands"
+)
+
+
+@bot.tree.command(name="help", description="このBotの使い方を表示します")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📖 BOOTH通知Bot の使い方",
+        description=(
+            "BOOTHのVRChat向け新作アイテムを自動でお知らせするBotだよ。\n"
+            "5分に1回BOOTHをチェックして、公開から10分以内の新作を通知するよ。"
+        ),
+        color=0xFF6473,
+    )
+    embed.add_field(
+        name="⚙️ 初期設定（3ステップ）",
+        value=(
+            "**1.** `/set-channel` — 通知チャンネルとジャンルを設定\n"
+            "**2.** `/filter add` — （任意）通知したいアバター名を登録\n"
+            "**3.** `/set-nsfw` — （任意）R-18の表示/非表示を切り替え"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="📌 コマンド一覧",
+        value=(
+            "`/set-channel` — 通知チャンネルとジャンルを設定\n"
+            "`/remove-channel` — このチャンネルの通知を解除\n"
+            "`/filter add` — アバター名フィルターを追加\n"
+            "`/filter remove` — フィルターを削除\n"
+            "`/filter list` — 登録済みフィルター一覧\n"
+            "`/set-nsfw allow|deny` — R-18の表示/非表示\n"
+            "`/status` — 現在の設定を確認\n"
+            "`/help` — このヘルプを表示"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="💡 フィルターについて",
+        value=(
+            "フィルターは「通知を絞り込む」機能だよ。\n"
+            "例: `/filter add セレスティア` → タグに「セレスティア」を含む商品だけ通知。\n"
+            "**未登録なら、選んだジャンルの新作は全部通知されるよ。**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔗 このBotを他のサーバーにも入れる",
+        value=f"[招待リンクはこちら]({INVITE_URL})",
+        inline=False,
+    )
+    embed.set_footer(text="BOOTH通知Bot（非公式） / BOOTHの公式Botではありません")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="stats", description="Botの稼働状況を表示します（管理者用）")
+async def stats_command(interaction: discord.Interaction):
+    if MANAGER_USER_ID is None or interaction.user.id != MANAGER_USER_ID:
+        await interaction.response.send_message(
+            "❌ このコマンドは管理者のみ使用できます。", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    async with db_connect() as db:
+        async with db.execute("SELECT COUNT(*) FROM channels") as cur:
+            channel_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM filters") as cur:
+            filter_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM shop_filters") as cur:
+            shop_filter_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM items") as cur:
+            item_count = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT MAX(notified_at) FROM items WHERE notified_at IS NOT NULL"
+        ) as cur:
+            last_notified = (await cur.fetchone())[0]
+        failure_count = await get_failure_count(db)
+
+    db_kind = "Turso" if (TURSO_DATABASE_URL and TURSO_AUTH_TOKEN) else "ローカルSQLite"
+
+    embed = discord.Embed(title="📊 Bot稼働状況", color=0x00BFFF)
+    embed.add_field(name="参加サーバー数", value=f"{len(bot.guilds)}", inline=True)
+    embed.add_field(name="通知チャンネル数", value=f"{channel_count}", inline=True)
+    embed.add_field(name="レイテンシ", value=f"{bot.latency * 1000:.0f} ms", inline=True)
+    embed.add_field(name="アバターフィルター", value=f"{filter_count}", inline=True)
+    embed.add_field(name="ショップフィルター", value=f"{shop_filter_count}", inline=True)
+    embed.add_field(name="蓄積アイテム数", value=f"{item_count}", inline=True)
+    embed.add_field(name="データベース", value=db_kind, inline=True)
+    embed.add_field(
+        name="連続失敗回数",
+        value=f"{failure_count}/{FAILURE_ALERT_THRESHOLD}",
+        inline=True,
+    )
+    embed.add_field(name="最終通知", value=str(last_notified or "なし"), inline=False)
+    embed.set_footer(text="BOOTH通知Bot 管理コマンド")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 # ───────────────────────────────────────────
-# BOOTH 取得層（Step 3 で実装）
+# BOOTH 取得層
 # ───────────────────────────────────────────
 async def fetch_with_retry(session: aiohttp.ClientSession, url: str) -> str | None:
     """HTTP GET をリトライ付きで実行する。"""
