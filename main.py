@@ -1422,12 +1422,12 @@ async def load_all_channel_filters(
     """全チャンネルのフィルターをまとめて読み込む（通知処理の高速化用）。"""
     avatar_filters: dict[int, list[tuple[str, str]]] = {}
     async with db.execute("SELECT channel_id, avatar_name, normalized_name FROM filters") as cursor:
-        async for row in cursor:
+        for row in await cursor.fetchall():
             avatar_filters.setdefault(row[0], []).append((row[1], row[2]))
 
     shop_filters: dict[int, list[tuple[str, str]]] = {}
     async with db.execute("SELECT channel_id, shop_name, normalized_name FROM shop_filters") as cursor:
-        async for row in cursor:
+        for row in await cursor.fetchall():
             shop_filters.setdefault(row[0], []).append((row[1], row[2]))
 
     return avatar_filters, shop_filters
