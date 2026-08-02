@@ -107,24 +107,8 @@ class MyBot(commands.Bot):
         check_booth_job.start()
         send_dm_replies.start()
 
-# 管理用チャンネルに詳細警告を送る（失敗時はManagerにDMフォールバック）
+# 管理用チャンネルに詳細警告を送る（未設定/失敗時は Manager に DM フォールバック）
 async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) -> None:
-    if ADMIN_CHANNEL_ID is None:
-        log.warn("send_admin_alert", f"⚠️ ADMIN_CHANNEL_ID が未設定なので管理用警告をスキップ: {title}")
-        return
-
-    log.info("send_admin_alert", f"📤 管理用警告送信開始: {title} → ADMIN_CHANNEL_ID={ADMIN_CHANNEL_ID}")
-
-    channel = bot.get_channel(ADMIN_CHANNEL_ID)
-    fetch_error = None
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(ADMIN_CHANNEL_ID)
-            log.info("send_admin_alert", f"✅ 管理用チャンネルを fetch_channel で取得: #{getattr(channel, 'name', 'N/A')}")
-        except Exception as e:
-            fetch_error = str(e)
-            log.error("send_admin_alert", f"❌ 管理用チャンネル取得失敗 (ID: {ADMIN_CHANNEL_ID}): {e}")
-
     embed = discord.Embed(
         title=title,
         description=description,
@@ -134,27 +118,47 @@ async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) 
     embed.set_footer(text="BOOTH通知Bot 自己申告システム")
 
     channel_send_error = None
-    if channel is not None:
-        try:
-            await channel.send(embed=embed)
-            log.info("send_admin_alert", f"🚨 管理用チャンネルに警告を送信: {title}")
-            return
-        except Exception as e:
-            channel_send_error = str(e)
-            log.error("send_admin_alert", f"❌ 管理用チャンネルへの警告送信失敗: {e}")
-    else:
-        channel_send_error = fetch_error or "チャンネルがNoneです"
+    if ADMIN_CHANNEL_ID is not None:
+        log.info("send_admin_alert", f"📤 管理用警告送信開始: {title} → ADMIN_CHANNEL_ID={ADMIN_CHANNEL_ID}")
+        channel = bot.get_channel(ADMIN_CHANNEL_ID)
+        fetch_error = None
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(ADMIN_CHANNEL_ID)
+                log.info("send_admin_alert", f"✅ 管理用チャンネルを fetch_channel で取得: #{getattr(channel, 'name', 'N/A')}")
+            except Exception as e:
+                fetch_error = str(e)
+                log.error("send_admin_alert", f"❌ 管理用チャンネル取得失敗 (ID: {ADMIN_CHANNEL_ID}): {e}")
 
-    # チャンネル送信に失敗したらManagerにDMフォールバック
+        if channel is not None:
+            try:
+                await channel.send(embed=embed)
+                log.info("send_admin_alert", f"🚨 管理用チャンネルに警告を送信: {title}")
+                return
+            except Exception as e:
+                channel_send_error = str(e)
+                log.error("send_admin_alert", f"❌ 管理用チャンネルへの警告送信失敗: {e}")
+        else:
+            channel_send_error = fetch_error or "チャンネルがNoneです"
+    else:
+        log.info("send_admin_alert", f"📤 ADMIN_CHANNEL_ID 未設定のため Manager DM を試行: {title}")
+
+    # チャンネル未設定 or 送信失敗時は Manager に DM フォールバック
     if MANAGER_USER_ID is not None:
         try:
             manager = await bot.fetch_user(MANAGER_USER_ID)
             if manager is not None:
-                fallback_desc = (
-                    f"{description}\n\n"
-                    f"⚠️ 元の管理用チャンネル (ID: {ADMIN_CHANNEL_ID}) への送信に失敗しました:\n"
-                    f"`{channel_send_error}`"
-                )
+                if ADMIN_CHANNEL_ID is not None and channel_send_error:
+                    fallback_desc = (
+                        f"{description}\n\n"
+                        f"⚠️ 元の管理用チャンネル (ID: {ADMIN_CHANNEL_ID}) への送信に失敗しました:\n"
+                        f"`{channel_send_error}`"
+                    )
+                else:
+                    fallback_desc = (
+                        f"{description}\n\n"
+                        "⚠️ ADMIN_CHANNEL_ID が未設定なので、Manager DM にフォールバックしています。"
+                    )
                 fallback_embed = discord.Embed(
                     title=f"【フォールバック】{title}",
                     description=fallback_desc,
@@ -166,6 +170,8 @@ async def send_admin_alert(title: str, description: str, color: int = 0xFF0000) 
                 log.info("send_admin_alert", f"📩 Managerユーザー (ID: {MANAGER_USER_ID}) に警告をDM送信: {title}")
         except Exception as e:
             log.error("send_admin_alert", f"❌ ManagerユーザーへのDM送信も失敗 (ID: {MANAGER_USER_ID}): {e}")
+    else:
+        log.warn("send_admin_alert", "⚠️ ADMIN_CHANNEL_ID も MANAGER_USER_ID も未設定: アラートを送信できません")
 
 
 # 登録済み全チャンネルにユーザー向け告知を送る
