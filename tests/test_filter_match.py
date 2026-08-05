@@ -1,6 +1,7 @@
 """フィルターのマッチングロジックのテスト。
 
 broadcast_item 内のマッチ判定と同じロジックを検証する。
+アバターフィルターは BOOTH商品ID 基準（名前は保険）。
 """
 
 import json
@@ -9,19 +10,25 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils import normalize_avatar_name
+from utils import (
+    MATCH_BY_ID,
+    MATCH_BY_NAME,
+    clean_avatar_display_name,
+    extract_name_aliases,
+    match_avatar_filters,
+    normalize_avatar_name,
+)
 
 
-def match_avatar_filter(item_tags_json: str, filters: list[tuple[str, str]]) -> str | None:
-    """broadcast_item と同じアバター名フィルター判定。"""
-    if not filters:
-        return None
-    tag_names = json.loads(item_tags_json) if item_tags_json else []
-    tag_names_normalized = [normalize_avatar_name(t) for t in tag_names]
-    for avatar_name, normalized_name in filters:
-        if any(normalized_name in tag_norm for tag_norm in tag_names_normalized):
-            return avatar_name
-    return None
+def make_avatar_filter(item_id: str, title: str) -> tuple[str, str, str, str]:
+    """フィルター登録時と同じ形でレコードを作る。"""
+    display_name = clean_avatar_display_name(title)
+    return (
+        item_id,
+        display_name,
+        normalize_avatar_name(display_name),
+        json.dumps(extract_name_aliases(title), ensure_ascii=False),
+    )
 
 
 def match_shop_filter(shop_name: str, filters: list[tuple[str, str]]) -> str | None:
@@ -39,46 +46,111 @@ def make_filter(name: str) -> tuple[str, str]:
     return (name, normalize_avatar_name(name))
 
 
-# ── アバター名フィルター ─────────────────────
-
-def test_avatar_filter_exact_tag():
-    tags = json.dumps(["セレスティア", "VRChat"], ensure_ascii=False)
-    assert match_avatar_filter(tags, [make_filter("セレスティア")]) == "セレスティア"
+SHINANO = make_avatar_filter("6106863", "オリジナル3Dモデル「しなの」")
+KAGUYA = make_avatar_filter("8562330", "九尾オリジナル3Dモデル「輝夜」-kaguya-")
 
 
-def test_avatar_filter_partial_tag():
-    tags = json.dumps(["セレスティア用衣装"], ensure_ascii=False)
-    assert match_avatar_filter(tags, [make_filter("セレスティア")]) == "セレスティア"
+# ── アバターフィルター: 商品IDマッチ ─────────────────────
+
+def test_avatar_filter_matches_linked_item_id():
+    name, reason = match_avatar_filters(
+        ["6106863"], ["VRChat", "衣装"], "新作衣装", [SHINANO]
+    )
+    assert name == "しなの"
+    assert reason == MATCH_BY_ID
 
 
-def test_avatar_filter_hiragana_katakana():
-    tags = json.dumps(["せれすてぃあ"], ensure_ascii=False)
-    assert match_avatar_filter(tags, [make_filter("セレスティア")]) == "セレスティア"
+def test_avatar_filter_id_match_wins_over_name():
+    """IDが一致したフィルターが優先される。"""
+    name, reason = match_avatar_filters(
+        ["8562330"], ["しなの"], "衣装", [SHINANO, KAGUYA]
+    )
+    assert name == "輝夜"
+    assert reason == MATCH_BY_ID
 
 
-def test_avatar_filter_case_insensitive():
-    tags = json.dumps(["Selestia"], ensure_ascii=False)
-    assert match_avatar_filter(tags, [make_filter("selestia")]) == "selestia"
+def test_avatar_filter_unrelated_id_no_match():
+    name, reason = match_avatar_filters(
+        ["9999999"], ["VRChat"], "新作衣装", [SHINANO]
+    )
+    assert name is None
+    assert reason is None
 
 
-def test_avatar_filter_no_match():
-    tags = json.dumps(["マヌカ", "VRChat"], ensure_ascii=False)
-    assert match_avatar_filter(tags, [make_filter("セレスティア")]) is None
+def test_avatar_filter_no_filters_returns_none():
+    assert match_avatar_filters(["6106863"], ["しなの"], "衣装", []) == (None, None)
 
 
-def test_avatar_filter_empty_filters_returns_none():
-    tags = json.dumps(["セレスティア"], ensure_ascii=False)
-    assert match_avatar_filter(tags, []) is None
+# ── アバターフィルター: 名前の保険マッチ ─────────────────────
+
+def test_avatar_filter_name_fallback_from_tag():
+    """URLが貼られていなくてもタグ名で拾う。"""
+    name, reason = match_avatar_filters(
+        [], ["しなの対応", "VRChat"], "衣装", [SHINANO]
+    )
+    assert name == "しなの"
+    assert reason == MATCH_BY_NAME
 
 
-def test_avatar_filter_empty_tags():
-    assert match_avatar_filter("", [make_filter("セレスティア")]) is None
+def test_avatar_filter_name_fallback_from_title():
+    name, reason = match_avatar_filters(
+        [], ["VRChat"], "【輝夜対応】ぐるーみぃeyes", [KAGUYA]
+    )
+    assert name == "輝夜"
+    assert reason == MATCH_BY_NAME
 
 
-def test_avatar_filter_multiple_first_match_wins():
-    tags = json.dumps(["マヌカ用衣装"], ensure_ascii=False)
-    filters = [make_filter("セレスティア"), make_filter("マヌカ")]
-    assert match_avatar_filter(tags, filters) == "マヌカ"
+def test_avatar_filter_alias_fallback():
+    """英字別名（-kaguya-）でも拾える。"""
+    name, reason = match_avatar_filters(
+        [], ["kaguya", "VRChat"], "makeup texture", [KAGUYA]
+    )
+    assert name == "輝夜"
+    assert reason == MATCH_BY_NAME
+
+
+def test_avatar_filter_hiragana_katakana_fallback():
+    name, _ = match_avatar_filters([], ["シナノ"], "衣装", [SHINANO])
+    assert name == "しなの"
+
+
+def test_avatar_filter_no_match_at_all():
+    name, reason = match_avatar_filters([], ["マヌカ"], "衣装", [SHINANO])
+    assert name is None
+    assert reason is None
+
+
+def test_avatar_filter_empty_tags_and_title():
+    assert match_avatar_filters([], [], "", [SHINANO]) == (None, None)
+
+
+def test_avatar_filter_handles_broken_aliases_json():
+    broken = ("6106863", "しなの", normalize_avatar_name("しなの"), "not-json")
+    name, _ = match_avatar_filters([], ["しなの"], "衣装", [broken])
+    assert name == "しなの"
+
+
+def test_avatar_filter_accepts_int_item_id():
+    """DBがINTEGERで返してきても比較できる。"""
+    entry = (6106863, "しなの", normalize_avatar_name("しなの"), "[]")
+    name, reason = match_avatar_filters(["6106863"], [], "衣装", [entry])
+    assert name == "しなの"
+    assert reason == MATCH_BY_ID
+
+
+def test_short_ascii_name_does_not_partial_match():
+    """'Sio' が 'fusion' に部分一致して誤爆しない。"""
+    sio = make_avatar_filter("5650156", "【オリジナル3Dモデル】 Sio / しお / ver.2.01")
+    assert sio[1] == "Sio"
+    name, _ = match_avatar_filters([], ["fusion", "VRChat"], "衣装", [sio])
+    assert name is None
+
+
+def test_short_ascii_name_exact_tag_matches():
+    sio = make_avatar_filter("5650156", "【オリジナル3Dモデル】 Sio / しお / ver.2.01")
+    name, reason = match_avatar_filters([], ["Sio", "VRChat"], "衣装", [sio])
+    assert name == "Sio"
+    assert reason == MATCH_BY_NAME
 
 
 # ── ショップ名フィルター ─────────────────────

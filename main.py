@@ -2,7 +2,7 @@
 BOOTH VRChat 新作通知 Bot
 - BOOTH JSON API を使用
 - published_at で新作判定
-- チャンネルごとにカテゴリ / アバター名フィルター / R-18 設定
+- チャンネルごとにカテゴリ / アバターフィルター（BOOTH商品ID） / R-18 設定
 """
 
 import asyncio
@@ -21,6 +21,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from database import (
+    clear_legacy_name_filters,
+    count_legacy_name_filters,
     db_connect,
     get_failure_count,
     init_db,
@@ -33,13 +35,19 @@ from database import (
     TURSO_DATABASE_URL,
 )
 from utils import (
+    MATCH_BY_ID,
     MAX_FILTERS_PER_CHANNEL,
     MAX_FILTER_NAME_LENGTH,
+    clean_avatar_display_name,
+    extract_booth_item_id,
+    extract_name_aliases,
+    match_avatar_filters,
     normalize_avatar_name,
     validate_filter_name,
 )
 import logging_utils as log
 from booth import (
+    AVATAR_CATEGORY_NAMES,
     CATEGORY_LABELS as BOOTH_CATEGORY_LABELS,
     CHECK_INTERVAL_MINUTES,
     FAILURE_ALERT_THRESHOLD,
@@ -69,6 +77,15 @@ MANAGER_USER_ID_RAW = os.getenv("MANAGER_USER_ID", "")
 MANAGER_USER_ID = int(MANAGER_USER_ID_RAW) if MANAGER_USER_ID_RAW.strip().lstrip("-").isdigit() else None
 
 CATEGORY_LABELS = BOOTH_CATEGORY_LABELS
+
+# BOOTHへのリクエスト共通ヘッダ
+BOOTH_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 
 def validate_environment() -> list[str]:
@@ -400,8 +417,10 @@ async def on_guild_join(guild: discord.Guild):
     embed.add_field(
         name="2️⃣ 通知を絞り込む（任意）",
         value=(
-            "特定のアバター向けだけ受け取りたいときは `/filter add` を使ってね。\n"
-            "例: `/filter add セレスティア`\n"
+            "特定のアバター向けだけ受け取りたいときは `/filter` を使ってね。\n"
+            "アバターは **BOOTHの商品URL（末尾の7桁ID）** で登録するよ。\n"
+            "例: `https://booth.pm/ja/items/6106863`\n"
+            "通知には**アバター名**で表示されるよ。\n"
             "**登録しなければ、選んだジャンルの新作は全部通知されるよ。**"
         ),
         inline=False,
@@ -509,29 +528,149 @@ async def remove_channel(interaction: discord.Interaction):
     )
 
 
-class FilterNameModal(discord.ui.Modal):
-    """アバター名/ショップ名フィルター用モーダル。"""
+class AvatarFilterModal(discord.ui.Modal):
+    """アバターフィルター用モーダル（BOOTHのURL / 商品IDで指定）。"""
+
+    value = discord.ui.TextInput(
+        label="アバターのBOOTH URL または 商品ID",
+        placeholder="https://booth.pm/ja/items/1234567  または  1234567",
+        required=True,
+        max_length=200,
+    )
+
+    def __init__(self, action: Literal["add", "remove"]):
+        self.action = action
+        action_label = "追加" if action == "add" else "削除"
+        super().__init__(title=f"アバターフィルターの{action_label}")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = interaction.channel_id
+        raw_value = str(self.value).strip()
+
+        item_id, error = extract_booth_item_id(raw_value)
+        if error is not None:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        # 削除は DB だけ見れば済む
+        if self.action == "remove":
+            async with db_connect() as db:
+                cursor = await db.execute(
+                    "DELETE FROM avatar_filters WHERE channel_id = ? AND avatar_item_id = ?",
+                    (channel_id, item_id),
+                )
+                await db.commit()
+            if (cursor.rowcount or 0) > 0:
+                await interaction.response.send_message(
+                    f"❌ アバターフィルター（ID: `{item_id}`）を削除したよ。", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    f"⚠️ ID `{item_id}` は登録されていないよ。`/filter` で一覧を確認してね。",
+                    ephemeral=True,
+                )
+            return
+
+        # 追加は BOOTH に問い合わせて名前を取ってくる
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        async with db_connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM avatar_filters WHERE channel_id = ?",
+                (channel_id,),
+            ) as cur:
+                current_count = (await cur.fetchone())[0]
+
+            if current_count >= MAX_FILTERS_PER_CHANNEL:
+                await interaction.followup.send(
+                    f"⚠️ このチャンネルのアバターフィルターは上限"
+                    f"（{MAX_FILTERS_PER_CHANNEL}件）に達しているよ。\n"
+                    "`/filter` からいくつか削除してから追加してね。",
+                    ephemeral=True,
+                )
+                return
+
+            data = await fetch_booth_item(item_id)
+            if data is None:
+                await interaction.followup.send(
+                    f"⚠️ BOOTHで ID `{item_id}` の商品が見つからなかったよ。\n"
+                    "アバターの商品ページのURLをそのまま貼ってみてね。",
+                    ephemeral=True,
+                )
+                return
+
+            title = (data.get("name") or "").strip()
+            category_name = ""
+            category_data = data.get("category")
+            if isinstance(category_data, dict):
+                category_name = category_data.get("name", "") or ""
+
+            display_name = clean_avatar_display_name(title)
+            normalized = normalize_avatar_name(display_name)
+            aliases = extract_name_aliases(title)
+            item_url = f"https://booth.pm/ja/items/{item_id}"
+
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO avatar_filters
+                        (channel_id, avatar_item_id, avatar_name, normalized_name, aliases, item_url)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        channel_id,
+                        item_id,
+                        display_name,
+                        normalized,
+                        json.dumps(aliases, ensure_ascii=False),
+                        item_url,
+                    ),
+                )
+                await db.commit()
+            except Exception as e:
+                log.warn("AvatarFilterModal", f"⚠️ アバターフィルター追加エラー: {e}")
+                await interaction.followup.send(
+                    f"⚠️ アバター「`{display_name}`」（ID: `{item_id}`）は既に登録されているみたい。",
+                    ephemeral=True,
+                )
+                return
+
+        lines = [
+            f"✅ アバター **{display_name}** をフィルターに追加したよ！",
+            f"　🆔 ID: `{item_id}`　（{current_count + 1}/{MAX_FILTERS_PER_CHANNEL}件）",
+            f"　📦 商品名: {title[:80]}",
+            f"　🔗 {item_url}",
+        ]
+        if category_name and category_name not in AVATAR_CATEGORY_NAMES:
+            lines.append(
+                f"\n⚠️ このIDのカテゴリは「{category_name}」でアバター本体じゃないみたい。"
+                "アバター本体のページのURLか確認してね（登録自体はできてるよ）。"
+            )
+        lines.append(
+            "\n💡 商品説明に **このアバターのURLが貼られている新作** を通知するよ。"
+            "URLが無くても名前が一致したら拾うようにしてるよ。"
+        )
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+class ShopFilterModal(discord.ui.Modal):
+    """ショップ名フィルター用モーダル。"""
 
     name = discord.ui.TextInput(
-        label="名前",
-        placeholder="例: セレスティア",
+        label="ショップ名",
+        placeholder="例: ポンデロニウム研究所",
         required=True,
         max_length=MAX_FILTER_NAME_LENGTH,
     )
 
-    def __init__(self, target: Literal["avatar", "shop"], action: Literal["add", "remove"]):
-        self.target = target
+    def __init__(self, action: Literal["add", "remove"]):
         self.action = action
-        target_label = "アバター名" if target == "avatar" else "ショップ名"
         action_label = "追加" if action == "add" else "削除"
-        super().__init__(title=f"{target_label}フィルターの{action_label}")
+        super().__init__(title=f"ショップ名フィルターの{action_label}")
 
     async def on_submit(self, interaction: discord.Interaction):
         channel_id = interaction.channel_id
         name_value = str(self.name).strip()
-        target_label = "アバター名" if self.target == "avatar" else "ショップ名"
-        table_name = "filters" if self.target == "avatar" else "shop_filters"
-        column_name = "avatar_name" if self.target == "avatar" else "shop_name"
 
         normalized, error = validate_filter_name(name_value)
         if error is not None:
@@ -540,55 +679,54 @@ class FilterNameModal(discord.ui.Modal):
 
         async with db_connect() as db:
             if self.action == "add":
-                # 上限チェック
                 async with db.execute(
-                    f"SELECT COUNT(*) FROM {table_name} WHERE channel_id = ?",
+                    "SELECT COUNT(*) FROM shop_filters WHERE channel_id = ?",
                     (channel_id,),
                 ) as cur:
                     current_count = (await cur.fetchone())[0]
                 if current_count >= MAX_FILTERS_PER_CHANNEL:
                     await interaction.response.send_message(
-                        f"⚠️ このチャンネルの{target_label}フィルターは上限"
+                        f"⚠️ このチャンネルのショップ名フィルターは上限"
                         f"（{MAX_FILTERS_PER_CHANNEL}件）に達しているよ。\n"
-                        f"`/filter remove` でいくつか削除してから追加してね。",
+                        "`/filter` からいくつか削除してから追加してね。",
                         ephemeral=True,
                     )
                     return
 
                 try:
                     await db.execute(
-                        f"""
-                        INSERT INTO {table_name} (channel_id, {column_name}, normalized_name)
+                        """
+                        INSERT INTO shop_filters (channel_id, shop_name, normalized_name)
                         VALUES (?, ?, ?)
                         """,
                         (channel_id, name_value, normalized),
                     )
                     await db.commit()
                     await interaction.response.send_message(
-                        f"✅ {target_label}「`{name_value}`」をフィルターに追加したよ！\n"
+                        f"✅ ショップ名「`{name_value}`」をフィルターに追加したよ！\n"
                         f"（正規化: `{normalized}` / {current_count + 1}/{MAX_FILTERS_PER_CHANNEL}件）",
                         ephemeral=True,
                     )
                 except Exception as e:
-                    log.warn("on_submit", f"⚠️ フィルター追加エラー: {e}")
+                    log.warn("ShopFilterModal", f"⚠️ フィルター追加エラー: {e}")
                     await interaction.response.send_message(
-                        f"⚠️ {target_label}「`{name_value}`」は既に登録されているか、登録できないよ。",
+                        f"⚠️ ショップ名「`{name_value}`」は既に登録されているか、登録できないよ。",
                         ephemeral=True,
                     )
             else:
                 cursor = await db.execute(
-                    f"DELETE FROM {table_name} WHERE channel_id = ? AND normalized_name = ?",
+                    "DELETE FROM shop_filters WHERE channel_id = ? AND normalized_name = ?",
                     (channel_id, normalized),
                 )
                 await db.commit()
-                if cursor.rowcount > 0:
+                if (cursor.rowcount or 0) > 0:
                     await interaction.response.send_message(
-                        f"❌ {target_label}「`{name_value}`」をフィルターから削除したよ。",
+                        f"❌ ショップ名「`{name_value}`」をフィルターから削除したよ。",
                         ephemeral=True,
                     )
                 else:
                     await interaction.response.send_message(
-                        f"⚠️ {target_label}「`{name_value}`」は登録されていないよ。",
+                        f"⚠️ ショップ名「`{name_value}`」は登録されていないよ。",
                         ephemeral=True,
                     )
 
@@ -596,54 +734,65 @@ class FilterNameModal(discord.ui.Modal):
 class FilterDeleteButton(discord.ui.Button):
     """登録済みフィルターを削除するボタン。"""
 
-    def __init__(self, target: Literal["avatar", "shop"], normalized_name: str, display_name: str):
+    def __init__(self, target: Literal["avatar", "shop"], key: str, display_name: str, row: int = 0):
         self.target = target
-        self.normalized_name = normalized_name
+        self.key = key
+        self.display_name = display_name
         super().__init__(
             label=f"❌ {display_name[:20]}",
             style=discord.ButtonStyle.danger,
-            row=0 if target == "avatar" else 1,
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction):
         channel_id = interaction.channel_id
-        table_name = "filters" if self.target == "avatar" else "shop_filters"
-        target_label = "アバター名" if self.target == "avatar" else "ショップ名"
 
         async with db_connect() as db:
-            cursor = await db.execute(
-                f"DELETE FROM {table_name} WHERE channel_id = ? AND normalized_name = ?",
-                (channel_id, self.normalized_name),
-            )
+            if self.target == "avatar":
+                cursor = await db.execute(
+                    "DELETE FROM avatar_filters WHERE channel_id = ? AND avatar_item_id = ?",
+                    (channel_id, self.key),
+                )
+                target_label = "アバター"
+            else:
+                cursor = await db.execute(
+                    "DELETE FROM shop_filters WHERE channel_id = ? AND normalized_name = ?",
+                    (channel_id, self.key),
+                )
+                target_label = "ショップ名"
             await db.commit()
 
-        if cursor.rowcount > 0:
+        if (cursor.rowcount or 0) > 0:
             await interaction.response.send_message(
-                f"❌ {target_label}「`{self.label[2:].strip()}`」を削除したよ。", ephemeral=True
+                f"❌ {target_label}「`{self.display_name}`」を削除したよ。", ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                f"⚠️ 既に削除されているよ。", ephemeral=True
+                "⚠️ 既に削除されているよ。", ephemeral=True
             )
 
 
 class FilterListView(discord.ui.View):
-    """登録済みフィルターをボタン付きで表示するビュー。追加ボタンも含む。"""
+    """登録済みフィルターをボタン付きで表示するビュー。追加ボタンも含む。
 
-    def __init__(self, avatar_filters: list[tuple[str, str]], shop_filters: list[tuple[str, str]]):
+    Discordの制約（1行5個・最大5行）に合わせて、アバターは row0-1、
+    ショップは row2-3、追加ボタンは row4 に置く。
+    """
+
+    def __init__(self, avatar_filters: list[tuple], shop_filters: list[tuple[str, str]]):
         super().__init__(timeout=180)
+        for i, entry in enumerate(avatar_filters[:10]):
+            self.add_item(FilterDeleteButton("avatar", str(entry[0]), entry[1], row=i // 5))
+        for i, (display_name, normalized) in enumerate(shop_filters[:10]):
+            self.add_item(FilterDeleteButton("shop", normalized, display_name, row=2 + i // 5))
         self.add_item(FilterAddMenuButton())
-        for display_name, normalized in avatar_filters:
-            self.add_item(FilterDeleteButton("avatar", normalized, display_name))
-        for display_name, normalized in shop_filters:
-            self.add_item(FilterDeleteButton("shop", normalized, display_name))
 
 
 class FilterAddMenuButton(discord.ui.Button):
     """フィルター追加用の選択画面を開くボタン。"""
 
     def __init__(self):
-        super().__init__(label="➕ フィルターを追加", style=discord.ButtonStyle.primary, row=2)
+        super().__init__(label="➕ フィルターを追加", style=discord.ButtonStyle.primary, row=4)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.edit_message(
@@ -667,32 +816,45 @@ class FilterActionSelect(discord.ui.View):
 
 
 class FilterTargetSelect(discord.ui.View):
-    """アバター名/ショップ名を選ぶビュー。"""
+    """アバター/ショップ名を選ぶビュー。"""
 
     def __init__(self, action: Literal["add", "remove"]):
         self.action = action
         super().__init__(timeout=180)
 
-    @discord.ui.button(label="👤 アバター名", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="👤 アバター（URL / ID）", style=discord.ButtonStyle.primary)
     async def avatar_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(FilterNameModal("avatar", self.action))
+        await interaction.response.send_modal(AvatarFilterModal(self.action))
 
     @discord.ui.button(label="🏪 ショップ名", style=discord.ButtonStyle.primary)
     async def shop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(FilterNameModal("shop", self.action))
+        await interaction.response.send_modal(ShopFilterModal(self.action))
 
 
-@bot.tree.command(name="filter", description="アバター名/ショップ名のフィルターを管理します")
+@bot.tree.command(name="filter", description="アバター(URL/ID)・ショップ名のフィルターを管理します")
 async def filter_command(interaction: discord.Interaction):
     channel_id = interaction.channel_id
     async with db_connect() as db:
         avatar_filters = await load_channel_filters(db, channel_id)
         shop_filters = await load_channel_shop_filters(db, channel_id)
+        legacy_count = await count_legacy_name_filters(db, channel_id)
+        if legacy_count:
+            # 旧「アバター名」フィルターはID方式に置き換わったので掃除する
+            await clear_legacy_name_filters(db, channel_id)
+
+    legacy_notice = ""
+    if legacy_count:
+        legacy_notice = (
+            f"\n♻️ 旧方式（アバター名）のフィルター {legacy_count} 件を削除したよ。\n"
+            "これからは **アバターのBOOTH URL / 商品ID** で登録してね。"
+        )
 
     if not avatar_filters and not shop_filters:
         await interaction.response.send_message(
             "📭 このチャンネルにはフィルターが登録されていないよ。\n"
-            "「➕ フィルターを追加」ボタンから追加してね。",
+            "「➕ フィルターを追加」ボタンから追加してね。\n"
+            "アバターは **BOOTHのURL（末尾の7桁ID）** で指定するよ。"
+            + legacy_notice,
             view=FilterActionSelect(),
             ephemeral=True,
         )
@@ -700,10 +862,18 @@ async def filter_command(interaction: discord.Interaction):
 
     lines = ["📌 このチャンネルのフィルター一覧"]
     if avatar_filters:
-        lines.append(f"\n👤 アバター名（{len(avatar_filters)}件）")
+        lines.append(f"\n👤 アバター（{len(avatar_filters)}件）")
+        for entry in avatar_filters[:10]:
+            lines.append(f"　• **{entry[1]}** — `{entry[0]}`")
+        if len(avatar_filters) > 10:
+            lines.append(f"　…ほか {len(avatar_filters) - 10} 件")
     if shop_filters:
         lines.append(f"\n🏪 ショップ名（{len(shop_filters)}件）")
+        for display_name, _ in shop_filters[:10]:
+            lines.append(f"　• `{display_name}`")
     lines.append("\n❌ ボタンを押すとそのフィルターを削除できるよ。")
+    if legacy_notice:
+        lines.append(legacy_notice)
 
     await interaction.response.send_message(
         "\n".join(lines),
@@ -761,7 +931,11 @@ async def status(interaction: discord.Interaction):
         categories_text = row[0] if row[0] else "未設定"
         nsfw_text = "表示" if row[1] else "非表示"
 
-    filters_text = ", ".join([f"`{f[0]}`" for f in filters]) if filters else "未登録"
+    filters_text = (
+        "\n".join([f"• **{f[1]}** — `{f[0]}`" for f in filters[:10]]) if filters else "未登録"
+    )
+    if filters and len(filters) > 10:
+        filters_text += f"\n…ほか {len(filters) - 10} 件"
     shop_filters_text = (
         ", ".join([f"`{f[0]}`" for f in shop_filters]) if shop_filters else "未登録"
     )
@@ -772,12 +946,15 @@ async def status(interaction: discord.Interaction):
     )
     embed.add_field(name="通知カテゴリ", value=categories_text, inline=False)
     embed.add_field(name="R-18設定", value=nsfw_text, inline=False)
-    embed.add_field(name="アバター名フィルター", value=filters_text, inline=False)
+    embed.add_field(name="アバターフィルター（名前 — ID）", value=filters_text, inline=False)
     embed.add_field(name="ショップ名フィルター", value=shop_filters_text, inline=False)
     if filters or shop_filters:
         embed.add_field(
             name="ℹ️ フィルターの動作",
-            value="登録したキーワードに一致する商品**だけ**通知されるよ。",
+            value=(
+                "登録したアバター / ショップに一致する商品**だけ**通知されるよ。\n"
+                "アバターは商品説明に貼られた**アバターのBOOTH URL**で判定してるよ。"
+            ),
             inline=False,
         )
     else:
@@ -812,7 +989,7 @@ async def help_command(interaction: discord.Interaction):
         name="⚙️ 初期設定（3ステップ）",
         value=(
             "**1.** `/set-channel` — 通知チャンネルとジャンルを設定\n"
-            "**2.** `/filter add` — （任意）通知したいアバター名を登録\n"
+            "**2.** `/filter` — （任意）通知したいアバターを登録\n"
             "**3.** `/set-nsfw` — （任意）R-18の表示/非表示を切り替え"
         ),
         inline=False,
@@ -822,9 +999,7 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/set-channel` — 通知チャンネルとジャンルを設定\n"
             "`/remove-channel` — このチャンネルの通知を解除\n"
-            "`/filter add` — アバター名フィルターを追加\n"
-            "`/filter remove` — フィルターを削除\n"
-            "`/filter list` — 登録済みフィルター一覧\n"
+            "`/filter` — フィルターの一覧 / 追加 / 削除\n"
             "`/set-nsfw allow|deny` — R-18の表示/非表示\n"
             "`/status` — 現在の設定を確認\n"
             "`/help` — このヘルプを表示"
@@ -835,7 +1010,10 @@ async def help_command(interaction: discord.Interaction):
         name="💡 フィルターについて",
         value=(
             "フィルターは「通知を絞り込む」機能だよ。\n"
-            "例: `/filter add セレスティア` → タグに「セレスティア」を含む商品だけ通知。\n"
+            "アバターは **BOOTHのURL（末尾の7桁ID）** で登録するよ。\n"
+            "例: `https://booth.pm/ja/items/6106863` を登録 → "
+            "商品説明にそのアバターのURLが貼られている新作だけ通知。\n"
+            "通知には**アバター名**で表示されるよ。\n"
             "**未登録なら、選んだジャンルの新作は全部通知されるよ。**"
         ),
         inline=False,
@@ -863,7 +1041,7 @@ async def stats_command(interaction: discord.Interaction):
     async with db_connect() as db:
         async with db.execute("SELECT COUNT(*) FROM channels") as cur:
             channel_count = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM filters") as cur:
+        async with db.execute("SELECT COUNT(*) FROM avatar_filters") as cur:
             filter_count = (await cur.fetchone())[0]
         async with db.execute("SELECT COUNT(*) FROM shop_filters") as cur:
             shop_filter_count = (await cur.fetchone())[0]
@@ -950,6 +1128,16 @@ async def fetch_item_json(session: aiohttp.ClientSession, item_id: str) -> dict 
         return None
 
 
+async def fetch_booth_item(item_id: str) -> dict | None:
+    """単発でBOOTH商品情報を取得する（フィルター登録時のアバター名解決用）。"""
+    try:
+        async with aiohttp.ClientSession(headers=BOOTH_REQUEST_HEADERS) as session:
+            return await fetch_item_json(session, item_id)
+    except Exception as e:
+        log.error("fetch_booth_item", f"❌ 商品情報の取得に失敗 (ID: {item_id}): {e}")
+        return None
+
+
 # ───────────────────────────────────────────
 # 通知ロジック（Step 4 で実装）
 # ───────────────────────────────────────────
@@ -961,15 +1149,7 @@ async def run_check_booth_job():
     now = datetime.datetime.now(datetime.timezone.utc)
     log.info("run_check_booth_job", f"\n🔍 --- 【巡回スタート】{now:%Y-%m-%d %H:%M:%S} ---")
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=BOOTH_REQUEST_HEADERS) as session:
         # 1. 検索ページから商品IDを収集
         all_item_ids: list[str] = []
         for page in range(1, SEARCH_PAGES + 1):
@@ -1267,19 +1447,26 @@ async def broadcast_item(
         if item["is_adult"] and not allow_nsfw:
             continue
 
-        # アバター名フィルターチェック
+        # アバターフィルターチェック（BOOTH商品ID基準 / 名前は保険）
         if all_avatar_filters is not None:
             avatar_filters = all_avatar_filters.get(channel_id, [])
         else:
             avatar_filters = await load_channel_filters(db, channel_id)
+
         matched_avatar_filter = None
+        avatar_match_reason = None
         if avatar_filters:
-            tag_names = json.loads(item["tags"]) if item["tags"] else []
-            tag_names_normalized = [normalize_avatar_name(t) for t in tag_names]
-            for avatar_name, normalized_name in avatar_filters:
-                if any(normalized_name in tag_norm for tag_norm in tag_names_normalized):
-                    matched_avatar_filter = avatar_name
-                    break
+            try:
+                tag_names = json.loads(item["tags"]) if item["tags"] else []
+            except (ValueError, TypeError):
+                tag_names = []
+            try:
+                linked_ids = json.loads(item.get("linked_item_ids") or "[]")
+            except (ValueError, TypeError):
+                linked_ids = []
+            matched_avatar_filter, avatar_match_reason = match_avatar_filters(
+                linked_ids, tag_names, item["title"], avatar_filters
+            )
 
         # ショップ名フィルターチェック
         if all_shop_filters is not None:
@@ -1301,7 +1488,8 @@ async def broadcast_item(
         # description にマッチしたフィルターを表示
         filter_lines = []
         if matched_avatar_filter:
-            filter_lines.append(f"🏷️ アバター: `{matched_avatar_filter}`")
+            suffix = "" if avatar_match_reason == MATCH_BY_ID else "（名前一致）"
+            filter_lines.append(f"🏷️ アバター: `{matched_avatar_filter}`{suffix}")
         if matched_shop_filter:
             filter_lines.append(f"🏪 ショップ: `{matched_shop_filter}`")
         filter_text = "\n".join(filter_lines)

@@ -231,6 +231,19 @@ async def init_db(db: aiosqlite.Connection) -> None:
             UNIQUE(channel_id, normalized_name)
         )
     """)
+    # アバターフィルター（BOOTH商品ID基準）。表示用の名前も一緒に持つ
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS avatar_filters (
+            filter_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL,
+            avatar_item_id TEXT NOT NULL,
+            avatar_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            aliases TEXT,
+            item_url TEXT,
+            UNIQUE(channel_id, avatar_item_id)
+        )
+    """)
     await db.execute("""
         CREATE TABLE IF NOT EXISTS bot_state (
             key TEXT PRIMARY KEY,
@@ -304,12 +317,40 @@ async def set_failure_count(db: aiosqlite.Connection, count: int) -> None:
     await db.commit()
 
 
-async def load_channel_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str]]:
+async def load_channel_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str, str, str]]:
+    """チャンネルのアバターフィルターを読み込む。
+
+    Returns:
+        [(avatar_item_id, avatar_name, normalized_name, aliases_json), ...]
+    """
     async with db.execute(
-        "SELECT avatar_name, normalized_name FROM filters WHERE channel_id = ?",
+        "SELECT avatar_item_id, avatar_name, normalized_name, aliases "
+        "FROM avatar_filters WHERE channel_id = ?",
         (channel_id,),
     ) as cursor:
         return await cursor.fetchall()
+
+
+async def count_legacy_name_filters(db: aiosqlite.Connection, channel_id: int) -> int:
+    """旧「アバター名」フィルターの残存件数（移行案内用）。"""
+    try:
+        async with db.execute(
+            "SELECT COUNT(*) FROM filters WHERE channel_id = ?", (channel_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+async def clear_legacy_name_filters(db: aiosqlite.Connection, channel_id: int) -> int:
+    """旧「アバター名」フィルターを削除する。"""
+    try:
+        cursor = await db.execute("DELETE FROM filters WHERE channel_id = ?", (channel_id,))
+        await db.commit()
+        return cursor.rowcount or 0
+    except Exception:
+        return 0
 
 
 async def load_channel_shop_filters(db: aiosqlite.Connection, channel_id: int) -> list[tuple[str, str]]:
@@ -322,12 +363,14 @@ async def load_channel_shop_filters(db: aiosqlite.Connection, channel_id: int) -
 
 async def load_all_channel_filters(
     db: aiosqlite.Connection,
-) -> tuple[dict[int, list[tuple[str, str]]], dict[int, list[tuple[str, str]]]]:
+) -> tuple[dict[int, list[tuple[str, str, str, str]]], dict[int, list[tuple[str, str]]]]:
     """全チャンネルのフィルターをまとめて読み込む（通知処理の高速化用）。"""
-    avatar_filters: dict[int, list[tuple[str, str]]] = {}
-    async with db.execute("SELECT channel_id, avatar_name, normalized_name FROM filters") as cursor:
+    avatar_filters: dict[int, list[tuple[str, str, str, str]]] = {}
+    async with db.execute(
+        "SELECT channel_id, avatar_item_id, avatar_name, normalized_name, aliases FROM avatar_filters"
+    ) as cursor:
         for row in await cursor.fetchall():
-            avatar_filters.setdefault(row[0], []).append((row[1], row[2]))
+            avatar_filters.setdefault(row[0], []).append((row[1], row[2], row[3], row[4]))
 
     shop_filters: dict[int, list[tuple[str, str]]] = {}
     async with db.execute("SELECT channel_id, shop_name, normalized_name FROM shop_filters") as cursor:

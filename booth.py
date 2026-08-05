@@ -24,6 +24,28 @@ MAX_RETRIES = 3                 # HTTPリトライ回数
 RETRY_BASE_DELAY = 2            # リトライの基底秒数
 FAILURE_ALERT_THRESHOLD = 3     # 何回連続で失敗したら警告を出すか
 
+# アバター本体（3Dモデル）のBOOTHカテゴリ名
+AVATAR_CATEGORY_NAMES = ("3Dキャラクター", "3Dモデル（その他）")
+
+# 商品説明文に含まれる BOOTH 商品URL（対応アバターのリンク）
+BOOTH_ITEM_URL_PATTERN = re.compile(r"booth\.pm/(?:[A-Za-z-]+/)?items/(\d+)")
+
+
+def extract_linked_item_ids(data: dict) -> list[str]:
+    """商品説明文からリンクされているBOOTH商品IDを抽出する。
+
+    出品者が「対応アバター」として貼っているURLを拾うのが目的。
+    """
+    parts = [
+        data.get("description") or "",
+        data.get("factory_description") or "",
+    ]
+    ids: list[str] = []
+    for found in BOOTH_ITEM_URL_PATTERN.findall(" ".join(parts)):
+        if found not in ids:
+            ids.append(found)
+    return ids
+
 
 def map_category_label(category_name: str) -> str | None:
     """カテゴリ名からユーザー向けラベル（衣装/髪/小物/ギミック）を返す。"""
@@ -112,4 +134,5 @@ def parse_item_json(item_id: str, data: dict, category_label: str) -> dict | Non
         "shop_name": data.get("shop", {}).get("name", "") if isinstance(data.get("shop"), dict) else "",
         "shop_url": data.get("shop", {}).get("url", "") if isinstance(data.get("shop"), dict) else "",
         "tags": json.dumps(tags, ensure_ascii=False),
+        "linked_item_ids": json.dumps(extract_linked_item_ids(data)),
     }
